@@ -169,10 +169,10 @@ SBERTa/
 ## Citation
 
 ```bibtex
-@misc{sberta2024,
+@misc{sberta2026,
   title={SBERTa: Code-Switching BERT with ELECTRA-Style Pre-training},
-  author={[Your Name]},
-  year={2024},
+  author={Ainouche Abderahmane},
+  year={2026},
   note={General-purpose transformer for code-switched text}
 }
 ```
