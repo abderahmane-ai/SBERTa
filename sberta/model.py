@@ -221,8 +221,13 @@ class LanguagePrototypes(nn.Module):
 
     @property
     def tau(self) -> torch.Tensor:
-        """Always-positive temperature: τ = exp(log_τ)."""
-        return self.log_tau.exp()
+        """Always-positive temperature: τ = exp(log_τ), floored at 0.25.
+
+        The floor prevents the model from sharpening past the point where
+        prototype imbalance recovery becomes impossible. Without it, a
+        collapsed prototype at very low τ mathematically locks others out.
+        """
+        return self.log_tau.exp().clamp(min=0.25)
 
     def get_distributions(self, h: torch.Tensor) -> torch.Tensor:
         """
@@ -757,24 +762,34 @@ class SBERTaForPreTraining(nn.Module):
         # linguistically coherent spans rather than flipping per-token —
         # without any external labels or fastText dependency.
         #
-        # Curriculum: weight ramps linearly 0 → 1 starting at
-        # smooth_warmup_steps so that L_smooth only activates after the ELECTRA
-        # backbone has developed stable semantic structure.
-        smooth_weight = min(
+        # Curriculum: starts immediately at λ_min=0.05 (never fully zero) and
+        # ramps linearly to 1.0 over smooth_warmup_steps. The non-zero baseline
+        # prevents the backbone from baking in statistically-independent
+        # prototype assignments during a "blind" window that later smooth
+        # pressure cannot escape.
+        _lambda_min: float = 0.05
+        smooth_weight = _lambda_min + (1.0 - _lambda_min) * min(
             1.0,
-            max(0.0, global_step - self.config.smooth_warmup_steps)
-            / max(1, self.config.smooth_warmup_steps),
+            global_step / max(1, self.config.smooth_warmup_steps),
         )
-        if smooth_weight > 0.0:
-            # Only calculate s_t over boundaries where both the current and
-            # previous token are real (excludes pad→real and real→pad edges).
-            switch_mask = real[:, 1:] & real[:, :-1]        # (B, T-1)
-            if switch_mask.any():
-                loss_smooth = s_pre[:, 1:][switch_mask].mean()
-            else:
-                loss_smooth = input_ids.new_zeros(())
+        # Only calculate s_t over boundaries where both the current and
+        # previous token are real (excludes pad→real and real→pad edges).
+        switch_mask = real[:, 1:] & real[:, :-1]            # (B, T-1)
+        if switch_mask.any():
+            loss_smooth = s_pre[:, 1:][switch_mask].mean()
         else:
             loss_smooth = input_ids.new_zeros(())
+
+        # ── L_sharp (per-token prototype commitment) ──────────────────────
+        # Minimise per-token assignment entropy over real (non-pad) tokens.
+        # Forces each token to commit sharply to one prototype rather than
+        # maintaining a near-uniform distribution across K.
+        # This is the safe half of the information-theoretic objective:
+        # we do NOT add the batch-balance term (H of the mean distribution)
+        # which would force equal usage across K and would break the 65/35
+        # Darija-French corpus ratio by hallucinating language boundaries.
+        p0_real = p_pre[real]                                # (N_real, K)
+        loss_sharp = -(p0_real * (p0_real + 1e-9).log()).sum(dim=-1).mean()
 
         # ── L_div ────────────────────────────────────────────────────────
         loss_div = self.sberta.prototypes.diversity_loss()
@@ -786,18 +801,20 @@ class SBERTaForPreTraining(nn.Module):
             + cfg.rtd_weight * loss_rtd
             + cfg.lambda_smooth * smooth_weight * loss_smooth
             + cfg.lambda_div * loss_div
+            + cfg.lambda_sharp * loss_sharp
         )
 
         return {
-            "loss":             loss,
-            "loss_gen":         loss_gen.item(),
-            "loss_rtd":         loss_rtd.item(),
-            "loss_smooth":      loss_smooth.item(),
-            "smooth_weight":    smooth_weight,
-            "loss_div":         loss_div.item(),
-            "n_masked":         n_masked,
-            "language_probs":   p_ctx,    # (B, T, K) — context-refined, for monitoring
-            "switch_magnitudes": s,       # (B, T) — from corrupted input, for analysis
+            "loss":              loss,
+            "loss_gen":          loss_gen.item(),
+            "loss_rtd":          loss_rtd.item(),
+            "loss_smooth":       loss_smooth.item(),
+            "smooth_weight":     smooth_weight,
+            "loss_div":          loss_div.item(),
+            "loss_sharp":        loss_sharp.item(),
+            "n_masked":          n_masked,
+            "language_probs":    p_ctx,    # (B, T, K) — context-refined, for monitoring
+            "switch_magnitudes": s,        # (B, T) — from corrupted input, for analysis
         }
 
     def _init_weights(self, module: nn.Module) -> None:

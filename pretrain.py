@@ -586,7 +586,7 @@ def train(
     optimizer.zero_grad()
 
     # Loss accumulators — reset every log_every optimizer steps.
-    LOSS_KEYS = ("loss", "loss_gen", "loss_rtd", "loss_smooth", "loss_div")
+    LOSS_KEYS = ("loss", "loss_gen", "loss_rtd", "loss_smooth", "loss_div", "loss_sharp")
     acc: Dict[str, float] = {k: 0.0 for k in LOSS_KEYS}
     n_masked_acc: int = 0
     smooth_weight_acc: float = 0.0
@@ -668,7 +668,6 @@ def train(
         for k in LOSS_KEYS:
             acc[k] += step_acc[k]
         n_masked_acc += step_n_masked // grad_accum
-        smooth_weight_acc += out["smooth_weight"]
 
         # ── Optimiser step ────────────────────────────────────────────────
         scaler.unscale_(optimizer)
@@ -751,7 +750,7 @@ def train(
 
             log.info(
                 "step %7d/%d  loss %.4f "
-                "[gen=%.4f rtd=%.4f smooth=%.4f(w=%.2f) div=%.4f]"
+                "[gen=%.4f rtd=%.4f smooth=%.4f(w=%.2f) div=%.4f sharp=%.4f]"
                 "  ppl %.1f  τ %.3f  masked/step %.0f"
                 "  lr %.2e  ‖g‖ %.3f%s"
                 "  %.1f stp/s  %.0f tok/s",
@@ -759,7 +758,7 @@ def train(
                 avg["loss"],
                 avg["loss_gen"], avg["loss_rtd"],
                 avg["loss_smooth"], smooth_weight_acc / log_every,
-                avg["loss_div"],
+                avg["loss_div"], avg["loss_sharp"],
                 ppl, tau_val,
                 n_masked_acc / log_every,
                 lr_now, grad_norm, mem_str,
@@ -778,6 +777,7 @@ def train(
                 "loss_smooth":      avg["loss_smooth"],
                 "smooth_weight":    smooth_weight_acc / log_every,
                 "loss_div":         avg["loss_div"],
+                "loss_sharp":       avg["loss_sharp"],
                 "ppl":              ppl,
                 "tau":              tau_val,
                 "lr":               lr_now,
