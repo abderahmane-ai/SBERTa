@@ -1,0 +1,17 @@
+# ── Core — required at all times ──────────────────────────────────────────────
+torch>=2.3.0
+sentencepiece>=0.2.0
+
+# ── Optional: Modal GPU cloud ──────────────────────────────────────────────────
+# Needed only if launching training jobs via Modal.
+# modal>=0.64.0
+
+# ── Optional: data collection ─────────────────────────────────────────────────
+# Required only when re-scraping or re-downloading the corpus.
+# Scripts live in scripts/data/ and are NOT imported by pretrain.py.
+#
+# datasets>=2.14
+# requests>=2.28
+# beautifulsoup4>=4.12
+# tqdm>=4.65
+# google-api-python-client>=2.0
