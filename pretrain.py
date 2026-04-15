@@ -26,15 +26,16 @@ in the dataset or pass any external switch labels — the model discovers
 language boundaries autonomously via the unsupervised L_smooth loss.
 
 Combined loss:
-    L = L_gen  +  w_rtd · L_RTD  +  λ_smooth · w_curr · L_smooth  +  λ_div · L_div
+    L = L_gen  +  w_rtd · L_RTD  +  λ_smooth · w_curr · L_smooth  +  λ_sharp · L_sharp  +  λ_div · L_div
 
     L_gen        : generator MLM on switch-span-masked positions
     L_RTD        : discriminator real/replaced BCE at every real token
                    (6–7× more gradient signal than vanilla MLM)
     L_smooth     : unsupervised temporal stickiness — mean switch magnitude
-                   penalised so prototypes self-organise into language blocks
-                   (activates linearly after smooth_warmup_steps; no external
-                   labels or fastText model required)
+                   penalised immediately (w_min=0.05 at step 0, ramps to 1.0
+                   over smooth_warmup_steps); no external labels required
+    L_sharp      : per-token prototype commitment — minimises assignment entropy
+                   over real tokens so each token picks one language sharply
     L_div        : prototype diversity — prevents prototype collapse
 
 Checkpointing
@@ -465,9 +466,10 @@ def train(
         config.num_languages,
     )
     log.info(
-        "Loss weights: w_rtd=%.1f  λ_smooth=%.3f  λ_div=%.3f",
+        "Loss weights: w_rtd=%.1f  λ_smooth=%.3f  λ_sharp=%.3f  λ_div=%.3f",
         config.rtd_weight,
         config.lambda_smooth,
+        config.lambda_sharp,
         config.lambda_div,
     )
 

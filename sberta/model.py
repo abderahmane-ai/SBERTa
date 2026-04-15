@@ -20,11 +20,14 @@ Pre-training objectives (ELECTRA-style RTD):
   Discriminator: full SBERTa — RTD binary classification at every token position,
                  giving 6-7× more gradient signal than vanilla 15%-masked MLM.
 
-  L = L_gen + w_rtd · L_RTD + λ_switch · L_switch + λ_div · L_div
+  L = L_gen + w_rtd · L_RTD + λ_smooth · w_curr · L_smooth + λ_sharp · L_sharp + λ_div · L_div
 
   L_gen        : generator MLM (span-masked positions only; normalised by n_masked)
   L_RTD        : replaced token detection — supervises every real token position
-  L_switch     : binary switch detection with fastText silver labels
+  L_smooth     : unsupervised temporal stickiness — mean switch magnitude penalised
+                 with a curriculum schedule; no external labels required
+  L_sharp      : per-token prototype commitment — minimises assignment entropy so
+                 each token commits to one language rather than hedging uniformly
   L_div        : prototype diversity — prevents prototype collapse
 """
 
@@ -193,7 +196,6 @@ class LanguagePrototypes(nn.Module):
     Responsibilities:
       · Compute pre-contextual language distributions p⁽⁰⁾_t from raw h_base.
       · Compute continuous switch magnitudes s_t.
-      · Predict binary switch indicators for L_switch supervision.
       · Return prototype diversity regularisation loss L_div.
 
     Temperature τ is stored as log_τ for unconstrained optimisation and
@@ -657,16 +659,19 @@ class SBERTaForPreTraining(nn.Module):
       L_gen        : generator MLM on masked spans (trains generator)
       L_RTD        : discriminator real/replaced BCE (trains full SBERTa)
       L_smooth     : unsupervised temporal stickiness — mean switch magnitude
-                     penalised after smooth_warmup_steps (trains prototypes
-                     to self-organise into linguistically coherent blocks;
-                     no external labels required)
+                     penalised immediately from step 0 (w_min=0.05, ramps to 1.0
+                     over smooth_warmup_steps) to self-organise prototypes into
+                     linguistically coherent blocks; no external labels required
+      L_sharp      : per-token prototype commitment — minimises assignment
+                     entropy over real tokens, forcing sharp language choices
       L_div        : prototype diversity (prevents prototype collapse)
 
     Combined loss:
-      L = L_gen + w_rtd · L_RTD + λ_smooth · w_curr · L_smooth + λ_div · L_div
+      L = L_gen + w_rtd · L_RTD + λ_smooth · w_curr · L_smooth
+            + λ_sharp · L_sharp + λ_div · L_div
 
-      w_curr ramps linearly from 0 → 1 over smooth_warmup_steps so that
-      L_smooth only activates after the ELECTRA backbone has stabilised.
+      w_curr = 0.05 + 0.95 × min(1, step / smooth_warmup_steps)
+      Starts non-zero at step 0 to prevent the independent-sampling equilibrium.
     """
 
     def __init__(self, config: SBERTaConfig) -> None:

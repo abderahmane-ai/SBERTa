@@ -236,11 +236,19 @@ $$\mathcal{L}_{\text{smooth}} = \frac{1}{|\mathcal{B}|} \sum_{(t-1,\,t) \in \mat
 
 where $\mathcal{B}$ is the set of consecutive real-token boundary pairs (padding boundaries excluded).
 
-**Curriculum schedule:** Weighted by $w_{\text{curr}} \in [0, 1]$ that ramps linearly from 0 to 1 after `smooth_warmup_steps` (default 10,000), activating only after the ELECTRA backbone has stabilised.
+**Curriculum schedule:** Weighted by $w_{\text{curr}} \in [0.05, 1]$ that starts at $\lambda_{\min}=0.05$ immediately at step 0 and ramps linearly to 1.0 over `smooth_warmup_steps`. The non-zero baseline prevents the backbone from settling into an independent-sampling equilibrium during a blind warmup window.
 
 **Purpose:** Forces prototypes to self-organise into long, linguistically coherent spans rather than flipping per-token. No external labels or fastText model required — the model discovers language boundaries purely from the temporal structure of the data.
 
-### 8.4 Prototype Diversity Loss
+### 8.4 Per-Token Prototype Commitment Loss ($\mathcal{L}_{\text{sharp}}$)
+
+Minimise per-token assignment entropy over real (non-pad) tokens:
+
+$$\mathcal{L}_{\text{sharp}} = -\mathbb{E}_t\left[\sum_{k=1}^{K} p^{(0)}_{t,k} \log p^{(0)}_{t,k}\right]$$
+
+**Purpose:** Forces each token to commit sharply to one prototype rather than hedging probability mass uniformly across $K$ languages. Only the per-token entropy term is used — the batch-mean entropy (DINO-style balance term) is intentionally omitted to preserve the natural 65/35 Darija-French corpus imbalance.
+
+### 8.5 Prototype Diversity Loss
 
 Minimize pairwise cosine similarities to prevent collapse:
 
@@ -250,13 +258,14 @@ $$\mathcal{L}_{\text{div}} = \frac{2}{K(K-1)} \sum_{i=1}^{K-1} \sum_{j=i+1}^K \l
 
 ### 8.5 Combined Loss
 
-$$\mathcal{L} = \mathcal{L}_{\text{gen}} + w_{\text{rtd}} \mathcal{L}_{\text{RTD}} + \lambda_{\text{smooth}} \cdot w_{\text{curr}} \cdot \mathcal{L}_{\text{smooth}} + \lambda_{\text{div}} \mathcal{L}_{\text{div}}$$
+$$\mathcal{L} = \mathcal{L}_{\text{gen}} + w_{\text{rtd}} \mathcal{L}_{\text{RTD}} + \lambda_{\text{smooth}} \cdot w_{\text{curr}} \cdot \mathcal{L}_{\text{smooth}} + \lambda_{\text{sharp}} \mathcal{L}_{\text{sharp}} + \lambda_{\text{div}} \mathcal{L}_{\text{div}}$$
 
 **Default weights:**
 - $w_{\text{rtd}} = 50.0$ (ELECTRA standard)
-- $\lambda_{\text{smooth}} = 1.0$
+- $\lambda_{\text{smooth}} = 15.0$ (15:50 ratio vs RTD — sufficient to compete)
+- $\lambda_{\text{sharp}} = 1.0$ (per-token entropy penalty)
 - $\lambda_{\text{div}} = 0.1$
-- $w_{\text{curr}}$: linear ramp $0 \to 1$ over `smooth_warmup_steps` (default 10,000)
+- $w_{\text{curr}} = 0.05 + 0.95 \times \min(1,\, \text{step} / \texttt{smooth\_warmup\_steps})$, ramps from 0.05 → 1.0 over `smooth_warmup_steps` (default 5,000)
 
 ---
 
