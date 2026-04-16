@@ -435,6 +435,13 @@ def train(
     from sberta.model import SBERTaForPreTraining
     from sberta.tokenizer import SBERTaTokenizer
 
+    # ── Memory allocator fix (prevents fragmentation OOM) ─────────────────
+    # PyTorch's default allocator can accumulate large reserved-but-unallocated
+    # blocks during training, causing OOM even when total usage is well below
+    # GPU capacity.  expandable_segments:True allows the allocator to grow
+    # segments incrementally, eliminating fragmentation-induced crashes.
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
     # ── Device ────────────────────────────────────────────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info("Device: %s", device)
@@ -588,8 +595,9 @@ def train(
     optimizer.zero_grad()
 
     # Loss accumulators — reset every log_every optimizer steps.
-    LOSS_KEYS = ("loss", "loss_gen", "loss_rtd", "loss_smooth", "loss_div", "loss_sharp")
+    LOSS_KEYS = ("loss", "loss_gen", "loss_rtd", "loss_smooth", "loss_div", "loss_sharp", "loss_balance")
     acc: Dict[str, float] = {k: 0.0 for k in LOSS_KEYS}
+    rtd_acc_acc: float = 0.0  # RTD accuracy accumulator (separate — not a loss)
     n_masked_acc: int = 0
     smooth_weight_acc: float = 0.0
 
@@ -648,6 +656,7 @@ def train(
                 step_acc[k] += out[k] / grad_accum
             step_n_masked += out["n_masked"]
             smooth_weight_acc += out["smooth_weight"] / grad_accum
+            rtd_acc_acc += out["rtd_acc"] / grad_accum
 
             # Prototype usage and switch stats (no grad needed)
             with torch.no_grad():
@@ -722,8 +731,19 @@ def train(
                 proto_str = "  ".join(
                     f"p{i}={pct[i]:.1f}%" for i in range(config.num_languages)
                 )
+                # Prototype usage entropy — monitors collapse
+                usage = proto_counts / total_tokens
+                entropy = -(usage * (usage + 1e-9).log()).sum().item()
+                max_entropy = math.log(config.num_languages)
+                entropy_pct = entropy / max_entropy * 100.0
+                if entropy_pct < 80.0:
+                    log.warning(
+                        "⚠️  Prototype collapse! Entropy %.1f%% (target >80%%)",
+                        entropy_pct,
+                    )
             else:
                 proto_str = "N/A"
+                entropy_pct = 0.0
 
             # Pairwise prototype cosine similarities — monitors diversity loss
             with torch.no_grad():
@@ -752,21 +772,22 @@ def train(
 
             log.info(
                 "step %7d/%d  loss %.4f "
-                "[gen=%.4f rtd=%.4f smooth=%.4f(w=%.2f) div=%.4f sharp=%.4f]"
+                "[gen=%.4f rtd=%.4f(acc=%.1f%%) smooth=%.4f(w=%.2f) div=%.4f sharp=%.4f bal=%.4f]"
                 "  ppl %.1f  τ %.3f  masked/step %.0f"
                 "  lr %.2e  ‖g‖ %.3f%s"
                 "  %.1f stp/s  %.0f tok/s",
                 global_step, total_steps,
                 avg["loss"],
-                avg["loss_gen"], avg["loss_rtd"],
+                avg["loss_gen"],
+                avg["loss_rtd"], rtd_acc_acc / log_every * 100.0,
                 avg["loss_smooth"], smooth_weight_acc / log_every,
-                avg["loss_div"], avg["loss_sharp"],
+                avg["loss_div"], avg["loss_sharp"], avg["loss_balance"],
                 ppl, tau_val,
                 n_masked_acc / log_every,
                 lr_now, grad_norm, mem_str,
                 steps_per_sec, tok_per_sec,
             )
-            log.info("  prototypes : %s", proto_str)
+            log.info("  prototypes : %s  entropy=%.1f%%", proto_str, entropy_pct)
             log.info("  cosines    : %s", cos_str)
             log.info("  switch mag : mean=%s  max=%s", sw_mean_str, sw_max_str)
 
@@ -776,18 +797,22 @@ def train(
                 "loss":             avg["loss"],
                 "loss_gen":         avg["loss_gen"],
                 "loss_rtd":         avg["loss_rtd"],
+                "rtd_acc":          rtd_acc_acc / log_every,
                 "loss_smooth":      avg["loss_smooth"],
                 "smooth_weight":    smooth_weight_acc / log_every,
                 "loss_div":         avg["loss_div"],
                 "loss_sharp":       avg["loss_sharp"],
+                "loss_balance":     avg["loss_balance"],
                 "ppl":              ppl,
                 "tau":              tau_val,
                 "lr":               lr_now,
+                "proto_entropy_pct": entropy_pct,
             }
 
             acc          = {k: 0.0 for k in LOSS_KEYS}
             n_masked_acc = 0
             smooth_weight_acc = 0.0
+            rtd_acc_acc  = 0.0
             proto_counts.zero_()
             total_tokens = 0
             sw_sum = sw_max = 0.0

@@ -23,8 +23,8 @@ class SBERTaConfig:
 
     # ── Code-switching ────────────────────────────────────────────────────
     num_languages: int = 4          # K — number of prototype languages
-    proto_temperature: float = 0.5  # τ initial value; learnable if learnable_temperature
-    learnable_temperature: bool = True  # τ as unconstrained learnable parameter
+    proto_temperature: float = 0.5  # τ fixed value (prevents collapse from over-sharpening)
+    learnable_temperature: bool = False  # τ fixed (was True, caused collapse to 0.39)
 
     # ── Regularisation ────────────────────────────────────────────────────
     hidden_dropout_prob: float = 0.1
@@ -32,12 +32,13 @@ class SBERTaConfig:
 
     # ── Pre-training (ELECTRA-style RTD) ──────────────────────────────────
     mlm_probability: float = 0.15   # fraction of tokens targeted by span masking (generator)
-    rtd_weight: float = 50.0        # discriminator RTD loss coefficient
+    rtd_weight: float = 50.0        # discriminator RTD loss coefficient (anchor - main training signal)
     generator_size_divisor: int = 2   # generator hidden_size = hidden_size // this (d/2 for harder fakes)
-    lambda_smooth: float = 15.0       # temporal stickiness loss weight — 15:50 ratio vs RTD
-    smooth_warmup_steps: int = 5_000  # steps for full smooth curriculum ramp (starts at λ_min=0.05 immediately)
-    lambda_div: float = 0.1          # prototype diversity loss weight
-    lambda_sharp: float = 1.0        # per-token assignment entropy penalty (forces prototype commitment)
+    lambda_smooth: float = 5.0        # temporal stickiness (was 15.0 - reduced 3× to prevent over-clustering)
+    smooth_warmup_steps: int = 10_000  # steps for full smooth curriculum ramp (was 5k - doubled for stability)
+    lambda_div: float = 5.0          # prototype diversity (was 0.1 - increased 50× to prevent collapse)
+    lambda_sharp: float = 0.5        # per-token commitment (was 1.0 - reduced to allow softer assignments)
+    lambda_balance: float = 1.0      # soft minimum-usage: rescues dying prototypes below 1/(K*4) usage
 
     # ────────────────────────────────────────────────────────────────────
     def __post_init__(self) -> None:

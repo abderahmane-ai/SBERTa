@@ -260,17 +260,26 @@ class LanguagePrototypes(nn.Module):
 
     def diversity_loss(self) -> torch.Tensor:
         """
-        L_div = (2 / K(K−1)) · Σ_{i<j} cos²(ℓᵢ, ℓⱼ)
+        Margin-based repulsion loss:
+            L_div = (2 / K(K−1)) · Σ_{i<j} relu(cos(ℓᵢ, ℓⱼ) + margin)²
 
-        Minimising pushes prototypes toward orthogonality, preventing the
-        collapse that would make language distributions uniformly uninformative.
+        The margin (default 0.1) means the loss fires even when prototypes are
+        near-orthogonal (cos ≈ 0), giving a constant repulsion gradient from
+        step 0.  This fixes the timing asymmetry where the original cos²
+        formulation produced zero gradient at initialisation while L_smooth
+        was already pushing tokens toward shared prototypes.
+
+        At perfect orthogonality (cos = 0): loss = relu(0.1)² = 0.01 per pair.
+        At collapse (cos = 1):              loss = relu(1.1)² = 1.21 per pair.
+        Only when cos < −margin does the loss reach zero (better than orthogonal).
         """
+        _margin: float = 0.1
         L_n = F.normalize(self.prototypes, dim=-1)             # (K, d)
         cos = L_n @ L_n.T                                      # (K, K)
         mask = torch.triu(
             torch.ones(self.K, self.K, device=cos.device), diagonal=1
         )
-        return (cos.pow(2) * mask).sum() / (self.K * (self.K - 1) / 2.0)
+        return (F.relu(cos + _margin).pow(2) * mask).sum() / (self.K * (self.K - 1) / 2.0)
 
 
 # ─── Input Embeddings ─────────────────────────────────────────────────────────
@@ -755,11 +764,19 @@ class SBERTaForPreTraining(nn.Module):
         ) / n_masked
 
         # ── L_RTD (discriminator) ────────────────────────────────────────
+        rtd_logits = self.rtd_head(H).squeeze(-1)                  # (B, T)
         loss_rtd = F.binary_cross_entropy_with_logits(
-            self.rtd_head(H).squeeze(-1)[real],
+            rtd_logits[real],
             is_replaced[real],
             reduction="mean",
         )
+
+        # RTD accuracy — fraction of real tokens correctly classified.
+        # A discriminator predicting all-real scores ~(1 - replace_rate) ≈ 85%
+        # without learning anything.  Meaningful accuracy is well above that.
+        with torch.no_grad():
+            rtd_preds = (rtd_logits[real] > 0.0).float()
+            rtd_acc = (rtd_preds == is_replaced[real]).float().mean().item()
 
         # ── L_smooth (unsupervised temporal stickiness) ───────────────────
         # Penalise the mean switch magnitude over real consecutive token
@@ -799,6 +816,16 @@ class SBERTaForPreTraining(nn.Module):
         # ── L_div ────────────────────────────────────────────────────────
         loss_div = self.sberta.prototypes.diversity_loss()
 
+        # ── L_balance (soft minimum-usage) ───────────────────────────────
+        # Fires only when a prototype's mean usage drops below min_usage
+        # (1 / K*4 = 6.25% for K=4).  Does NOT force equal distribution —
+        # it only rescues dying prototypes, preserving the natural 65/35
+        # corpus ratio.  Complements L_sharp which rewards confident
+        # assignments without caring which prototype receives them.
+        _min_usage: float = 1.0 / (self.config.num_languages * 4)   # 6.25% for K=4
+        mean_usage = p0_real.mean(dim=0)                             # (K,)
+        loss_balance = F.relu(_min_usage - mean_usage).mean()
+
         # ── Combined loss ─────────────────────────────────────────────────
         cfg = self.config
         loss = (
@@ -807,6 +834,7 @@ class SBERTaForPreTraining(nn.Module):
             + cfg.lambda_smooth * smooth_weight * loss_smooth
             + cfg.lambda_div * loss_div
             + cfg.lambda_sharp * loss_sharp
+            + cfg.lambda_balance * loss_balance
         )
 
         return {
@@ -817,13 +845,37 @@ class SBERTaForPreTraining(nn.Module):
             "smooth_weight":     smooth_weight,
             "loss_div":          loss_div.item(),
             "loss_sharp":        loss_sharp.item(),
+            "loss_balance":      loss_balance.item(),
+            "rtd_acc":           rtd_acc,
             "n_masked":          n_masked,
             "language_probs":    p_ctx,    # (B, T, K) — context-refined, for monitoring
             "switch_magnitudes": s,        # (B, T) — from corrupted input, for analysis
         }
 
     def _init_weights(self, module: nn.Module) -> None:
-        """BERT-style initialisation: N(0, 0.02) for Linear and Embedding."""
+        """
+        BERT-style initialisation: N(0, 0.02) for Linear and Embedding.
+
+        LanguagePrototypes and SBERTaAttention are explicitly skipped because
+        they set their own carefully designed initialisations in __init__:
+          · LanguagePrototypes.prototypes — orthogonal init scaled by 0.5
+          · SBERTaAttention.compat        — identity init (starts from standard attention)
+          · SBERTaAttention.gamma         — zero init
+        Overwriting these with N(0, 0.02) would destroy the intended geometry
+        before training even begins.
+        """
+        if isinstance(module, LanguagePrototypes):
+            # Orthogonal init + scale handled in LanguagePrototypes.__init__
+            return
+        if isinstance(module, SBERTaAttention):
+            # Apply standard init to projection weights only;
+            # compat (identity) and gamma (zero) keep their custom inits.
+            nn.init.normal_(module.W_Q.weight, mean=0.0, std=0.02)
+            nn.init.normal_(module.W_K.weight, mean=0.0, std=0.02)
+            nn.init.normal_(module.W_V.weight, mean=0.0, std=0.02)
+            nn.init.normal_(module.W_O.weight, mean=0.0, std=0.02)
+            nn.init.zeros_(module.W_O.bias)
+            return
         if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
