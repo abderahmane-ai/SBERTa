@@ -26,17 +26,16 @@ in the dataset or pass any external switch labels — the model discovers
 language boundaries autonomously via the unsupervised L_smooth loss.
 
 Combined loss:
-    L = L_gen  +  w_rtd · L_RTD  +  λ_smooth · w_curr · L_smooth  +  λ_sharp · L_sharp  +  λ_div · L_div
+    L = L_gen  +  w_rtd · L_RTD  +  λ_smooth · w_curr · L_smooth  +  λ_div · L_div  +  λ_balance · L_balance
 
     L_gen        : generator MLM on switch-span-masked positions
     L_RTD        : discriminator real/replaced BCE at every real token
                    (6–7× more gradient signal than vanilla MLM)
     L_smooth     : unsupervised temporal stickiness — mean switch magnitude
-                   penalised immediately (w_min=0.05 at step 0, ramps to 1.0
-                   over smooth_warmup_steps); no external labels required
-    L_sharp      : per-token prototype commitment — minimises assignment entropy
-                   over real tokens so each token picks one language sharply
+                   penalised with a two-phase curriculum (burn-in → ramp);
+                   no external labels required
     L_div        : prototype diversity — prevents prototype collapse
+    L_balance    : soft minimum-usage — rescues dying prototypes below factor/K threshold
 
 Checkpointing
 -------------
@@ -473,11 +472,26 @@ def train(
         config.num_languages,
     )
     log.info(
-        "Loss weights: w_rtd=%.1f  λ_smooth=%.3f  λ_sharp=%.3f  λ_div=%.3f",
+        "Loss weights: w_rtd=%.1f  λ_smooth=%.3f  λ_div=%.3f  λ_balance=%.3f",
         config.rtd_weight,
         config.lambda_smooth,
-        config.lambda_sharp,
         config.lambda_div,
+        config.lambda_balance,
+    )
+    burnin_steps_abs = int(config.burnin_ratio * total_steps)
+    warmup_steps_abs = int(config.smooth_warmup_ratio * total_steps)
+    log.info(
+        "Schedule: burnin=%.1f%% (%d steps)  smooth_warmup=%.1f%% (%d steps)  smooth_w_min=%.3f",
+        config.burnin_ratio * 100,
+        burnin_steps_abs,
+        config.smooth_warmup_ratio * 100,
+        warmup_steps_abs,
+        config.smooth_weight_min,
+    )
+    log.info(
+        "Loss params: div_margin=%.3f  balance_factor=%.3f",
+        config.div_margin,
+        config.balance_min_usage_factor,
     )
 
     # ── Tokenizer ─────────────────────────────────────────────────────────
@@ -646,6 +660,7 @@ def train(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     global_step=global_step,
+                    total_steps=total_steps,
                 )
                 loss_scaled = out["loss"] / grad_accum
 

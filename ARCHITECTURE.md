@@ -198,7 +198,13 @@ $$\mathcal{L}_{\text{smooth}} = \frac{1}{|\mathcal{B}|} \sum_{(t-1,\,t) \in \mat
 
 where $\mathcal{B}$ is the set of consecutive real-token boundary pairs (padding boundaries excluded).
 
-**Curriculum schedule:** Weighted by $w_{\text{curr}} \in [0.05, 1]$ that starts at $\lambda_{\min}=0.05$ immediately at step 0 and ramps linearly to 1.0 over `smooth_warmup_steps`. The non-zero baseline prevents the backbone from settling into an independent-sampling equilibrium during a blind warmup window.
+**Curriculum schedule:** 
+
+- **Burn-in phase** (steps 0 to `burnin_ratio × total_steps`, default 2%): $w_{\text{curr}} = 0$. The loss is completely gated off so prototypes can separate geometrically via $\mathcal{L}_{\text{div}}$ alone before temporal stickiness starts pulling them together.
+- **Ramp phase** (duration `smooth_warmup_ratio × total_steps`, default 10%): $w_{\text{curr}}$ ramps linearly from `smooth_weight_min` (default 0.05) to 1.0.
+- **Full strength** (after ramp completes): $w_{\text{curr}} = 1.0$.
+
+The two-phase schedule prevents prototype collapse from simultaneous attraction (smooth) and repulsion (div) forces at initialization. Ratios scale automatically with total training steps.
 
 **Purpose:** Forces prototypes to self-organise into long, linguistically coherent spans rather than flipping per-token. No external labels or fastText model required — the model discovers language boundaries purely from the temporal structure of the data.
 
@@ -225,8 +231,8 @@ $$\mathcal{L} = \mathcal{L}_{\text{gen}} + w_{\text{rtd}} \mathcal{L}_{\text{RTD
 - $w_{\text{rtd}} = 50.0$ (ELECTRA standard)
 - $\lambda_{\text{smooth}} = 15.0$ (15:50 ratio vs RTD)
 - $\lambda_{\text{div}} = 1.0$ (conservative starting point; ablate upward if needed)
-- $\lambda_{\text{balance}} = 1.0$ (soft minimum-usage; fires only when prototype usage drops below $1/(K \times 4) = 6.25\%$)
-- $w_{\text{curr}} = 0.05 + 0.95 \times \min(1,\, \text{step} / \texttt{smooth\_warmup\_steps})$, ramps from 0.05 → 1.0 over `smooth_warmup_steps` (default 10,000)
+- $\lambda_{\text{balance}} = 1.0$ (soft minimum-usage; fires when prototype usage drops below `balance_min_usage_factor / K`, default factor=0.25 → 25% of uniform)
+- $w_{\text{curr}}$: see curriculum schedule above (burn-in → ramp → full strength)
 
 > **Note:** A per-token prototype commitment loss ($\mathcal{L}_{\text{sharp}}$) was considered but is not used. $\mathcal{L}_{\text{smooth}}$ and $\mathcal{L}_{\text{div}}$ together provide sufficient sharpening — explicit per-token entropy minimisation is redundant and can conflict with desirable soft distributions at language boundaries.
 

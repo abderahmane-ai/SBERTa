@@ -24,9 +24,9 @@ Pre-training objectives (ELECTRA-style RTD):
   L_gen        : generator MLM (span-masked positions only; normalised by n_masked)
   L_RTD        : replaced token detection — supervises every real token position
   L_smooth     : unsupervised temporal stickiness — mean switch magnitude penalised
-                 with a curriculum schedule; no external labels required
+                 with a two-phase curriculum (burn-in → ramp); no external labels required
   L_div        : prototype diversity — prevents prototype collapse
-  L_balance    : soft minimum-usage — rescues dying prototypes below 1/(K*4) usage
+  L_balance    : soft minimum-usage — rescues dying prototypes below factor/K threshold
 """
 
 from __future__ import annotations
@@ -116,19 +116,6 @@ def _switch_span_mask(
     return span_mask                                 # (B, T)
 
 
-# ─── Contextual Language Refinement ──────────────────────────────────────────
-# REMOVED: ContextualLanguageRefinement class
-#
-# Rationale: The 12-layer encoder with full T×T self-attention resolves
-# Latin-script ambiguity (e.g., "chat" = French vs English) far more
-# powerfully than a ±3 token windowed module. The encoder learns to
-# disambiguate through its own attention mechanism, making a separate
-# pre-refinement step architecturally redundant.
-#
-# Simplification: Feed p⁽⁰⁾ directly to C_h and γ. The encoder refines
-# language understanding through its 12 layers of contextual processing.
-
-
 # ─── Language Prototypes ──────────────────────────────────────────────────────
 
 
@@ -148,6 +135,7 @@ class LanguagePrototypes(nn.Module):
     def __init__(self, config: SBERTaConfig) -> None:
         super().__init__()
         self.K: int = config.num_languages
+        self.div_margin: float = config.div_margin
 
         # L ∈ ℝ^{K×d}: orthogonal init → well-separated starting geometry
         self.prototypes: nn.Parameter = nn.Parameter(
@@ -206,23 +194,16 @@ class LanguagePrototypes(nn.Module):
         Margin-based repulsion loss:
             L_div = (2 / K(K−1)) · Σ_{i<j} relu(cos(ℓᵢ, ℓⱼ) + margin)²
 
-        The margin (default 0.1) means the loss fires even when prototypes are
-        near-orthogonal (cos ≈ 0), giving a constant repulsion gradient from
-        step 0.  This fixes the timing asymmetry where the original cos²
-        formulation produced zero gradient at initialisation while L_smooth
-        was already pushing tokens toward shared prototypes.
-
-        At perfect orthogonality (cos = 0): loss = relu(0.1)² = 0.01 per pair.
-        At collapse (cos = 1):              loss = relu(1.1)² = 1.21 per pair.
-        Only when cos < −margin does the loss reach zero (better than orthogonal).
+        Fires even at near-orthogonal (cos ≈ 0), giving a constant repulsion
+        gradient from step 0.  Only reaches zero when cos < −margin (prototypes
+        are better than orthogonal).  margin is set via config.div_margin.
         """
-        _margin: float = 0.1
         L_n = F.normalize(self.prototypes, dim=-1)             # (K, d)
         cos = L_n @ L_n.T                                      # (K, K)
         mask = torch.triu(
             torch.ones(self.K, self.K, device=cos.device), diagonal=1
         )
-        return (F.relu(cos + _margin).pow(2) * mask).sum() / (self.K * (self.K - 1) / 2.0)
+        return (F.relu(cos + self.div_margin).pow(2) * mask).sum() / (self.K * (self.K - 1) / 2.0)
 
 
 # ─── Input Embeddings ─────────────────────────────────────────────────────────
@@ -537,11 +518,6 @@ class SBERTaModel(nn.Module):
 
     The encoder's 12 layers of full self-attention resolve ambiguity through
     contextual processing, making a separate windowed refinement step redundant.
-
-    Typical fine-tuning usage:
-        model = SBERTaModel(config)
-        H, p0, s = model(input_ids, attention_mask)
-        sentence_repr = _masked_mean_pool(H, attention_mask)
     """
 
     def __init__(self, config: SBERTaConfig) -> None:
@@ -603,24 +579,6 @@ class SBERTaForPreTraining(nn.Module):
       classifies every real token as real or replaced. Supervised at all T
       positions — not just the ~15% masked — giving 6-7× more gradient signal
       than vanilla MLM for the same data budget.
-
-    Training signals:
-      L_gen        : generator MLM on masked spans (trains generator)
-      L_RTD        : discriminator real/replaced BCE (trains full SBERTa)
-      L_smooth     : unsupervised temporal stickiness — mean switch magnitude
-                     penalised immediately from step 0 (w_min=0.05, ramps to 1.0
-                     over smooth_warmup_steps) to self-organise prototypes into
-                     linguistically coherent blocks; no external labels required
-      L_sharp      : per-token prototype commitment — minimises assignment
-                     entropy over real tokens, forcing sharp language choices
-      L_div        : prototype diversity (prevents prototype collapse)
-
-    Combined loss:
-      L = L_gen + w_rtd · L_RTD + λ_smooth · w_curr · L_smooth
-            + λ_sharp · L_sharp + λ_div · L_div
-
-      w_curr = 0.05 + 0.95 × min(1, step / smooth_warmup_steps)
-      Starts non-zero at step 0 to prevent the independent-sampling equilibrium.
     """
 
     def __init__(self, config: SBERTaConfig) -> None:
@@ -647,19 +605,27 @@ class SBERTaForPreTraining(nn.Module):
         self,
         input_ids: torch.Tensor,                         # (B, T)
         attention_mask: Optional[torch.Tensor] = None,   # (B, T) binary
+        segment_ids: Optional[torch.Tensor] = None,      # (B, T) document boundaries
         global_step: int = 0,                            # current training step (curriculum)
+        total_steps: int = 1,                            # total training steps (for ratio-based curriculum)
     ) -> dict:
         """
         Args:
             input_ids:      (B, T) — original (unmasked) token ids.
             attention_mask: (B, T) — 1 for real tokens, 0 for padding.
-            global_step:    current optimiser step; used to scale L_smooth.
+            segment_ids:    (B, T) — document segment IDs for packed sequences.
+                            Used to mask cross-document boundaries in L_smooth.
+                            If None, assumes single document per sequence.
+            global_step:    current optimiser step; used for curriculum schedule.
+            total_steps:    total training steps; used to compute absolute burn-in
+                            and warmup durations from config ratios.
         Returns:
             dict with 'loss' (scalar) and per-component .item() loss values.
         """
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
 
+        cfg = self.config
         real = attention_mask.bool()                               # (B, T)
 
         # ── Step 1: span mask from original input's language structure ────
@@ -669,10 +635,10 @@ class SBERTaForPreTraining(nn.Module):
         p_pre = self.sberta.prototypes.get_distributions(h_base)   # (B, T, K)
         s_pre = self.sberta.prototypes.get_switch_magnitudes(p_pre)  # (B, T)
 
-        span_mask = _switch_span_mask(p_pre, attention_mask, self.config.mlm_probability)
+        span_mask = _switch_span_mask(p_pre, attention_mask, cfg.mlm_probability)
 
         masked_ids = input_ids.clone()
-        masked_ids[span_mask] = self.config.mask_token_id
+        masked_ids[span_mask] = cfg.mask_token_id
 
         # ── Step 2: generator — single forward for both loss and sampling ─
         # Gradients flow through gen_logits for L_gen.
@@ -697,7 +663,7 @@ class SBERTaForPreTraining(nn.Module):
         gen_labels[span_mask] = input_ids[span_mask]
         n_masked = max(int(span_mask.sum().item()), 1)
         loss_gen = F.cross_entropy(
-            gen_logits.view(-1, self.config.vocab_size),
+            gen_logits.view(-1, cfg.vocab_size),
             gen_labels.view(-1),
             ignore_index=-100,
             reduction="sum",
@@ -718,53 +684,55 @@ class SBERTaForPreTraining(nn.Module):
             rtd_preds = (rtd_logits[real] > 0.0).float()
             rtd_acc = (rtd_preds == is_replaced[real]).float().mean().item()
 
+        # ── Geometric Burn-In ────────────────────────────────────────────
+        # L_smooth is gated off for the first burnin_ratio*total_steps so
+        # prototypes can separate geometrically (driven by L_div alone) before
+        # temporal stickiness starts pulling them together.
+        burnin_steps = int(cfg.burnin_ratio * total_steps)
+        in_burnin = global_step < burnin_steps
+
         # ── L_smooth (unsupervised temporal stickiness) ───────────────────
-        # Penalise the mean switch magnitude over real consecutive token
-        # boundaries.  Minimising E[s_t] forces the K prototypes to form long,
-        # linguistically coherent spans rather than flipping per-token —
-        # without any external labels or fastText dependency.
-        #
-        # Curriculum: starts immediately at λ_min=0.05 (never fully zero) and
-        # ramps linearly to 1.0 over smooth_warmup_steps. The non-zero baseline
-        # prevents the backbone from baking in statistically-independent
-        # prototype assignments during a "blind" window that later smooth
-        # pressure cannot escape.
-        _lambda_min: float = 0.05
-        smooth_weight = _lambda_min + (1.0 - _lambda_min) * min(
-            1.0,
-            global_step / max(1, self.config.smooth_warmup_steps),
-        )
-        # Only calculate s_t over boundaries where both the current and
-        # previous token are real (excludes pad→real and real→pad edges).
-        switch_mask = real[:, 1:] & real[:, :-1]            # (B, T-1)
-        if switch_mask.any():
-            loss_smooth = s_pre[:, 1:][switch_mask].mean()
-        else:
+        if in_burnin:
+            smooth_weight = 0.0
             loss_smooth = input_ids.new_zeros(())
+        else:
+            # Curriculum ramp: smooth_weight_min → 1.0 over smooth_warmup_ratio*total_steps
+            warmup_steps = int(cfg.smooth_warmup_ratio * total_steps)
+            smooth_weight = cfg.smooth_weight_min + (1.0 - cfg.smooth_weight_min) * min(
+                1.0,
+                (global_step - burnin_steps) / max(1, warmup_steps),
+            )
+            # Mask cross-document boundaries when segment_ids is provided
+            if segment_ids is not None:
+                cross_doc = segment_ids[:, 1:] != segment_ids[:, :-1]    # (B, T-1)
+                switch_mask = real[:, 1:] & real[:, :-1] & ~cross_doc    # (B, T-1)
+            else:
+                switch_mask = real[:, 1:] & real[:, :-1]                 # (B, T-1)
+            if switch_mask.any():
+                loss_smooth = s_pre[:, 1:][switch_mask].mean()
+            else:
+                loss_smooth = input_ids.new_zeros(())
 
         # ── L_sharp (per-token prototype commitment) ──────────────────────
-        # REMOVED: Set to zero. L_smooth + L_div provide sufficient sharpening.
-        # L_smooth creates coherent spans, L_div increases inter-prototype
-        # distance (implicitly sharpening softmax), making explicit per-token
-        # entropy minimization redundant and potentially conflicting at boundaries.
+        # Placeholder for future experiments. Currently unused — L_smooth and
+        # L_div together provide sufficient sharpening without explicit per-token
+        # entropy minimization, which can conflict with soft distributions at
+        # language boundaries.
         loss_sharp = input_ids.new_zeros(())
 
         # ── L_div ────────────────────────────────────────────────────────
         loss_div = self.sberta.prototypes.diversity_loss()
 
         # ── L_balance (soft minimum-usage) ───────────────────────────────
-        # Fires only when a prototype's mean usage drops below min_usage
-        # (1 / K*4 = 6.25% for K=4).  Does NOT force equal distribution —
-        # it only rescues dying prototypes, preserving the natural 65/35
-        # corpus ratio.  Complements L_div which pushes prototypes apart
-        # geometrically without caring about usage balance.
-        _min_usage: float = 1.0 / (self.config.num_languages * 4)   # 6.25% for K=4
+        # Floor = factor/K so the threshold scales with the number of prototypes.
+        # factor=0.25 means each prototype must capture at least 25% of its
+        # fair share (1/K), regardless of what K is set to.
         p0_real = p_pre[real]                                        # (N_real, K)
         mean_usage = p0_real.mean(dim=0)                             # (K,)
-        loss_balance = F.relu(_min_usage - mean_usage).mean()
+        min_usage = cfg.balance_min_usage_factor / cfg.num_languages
+        loss_balance = F.relu(min_usage - mean_usage).mean()
 
         # ── Combined loss ─────────────────────────────────────────────────
-        cfg = self.config
         loss = (
             loss_gen
             + cfg.rtd_weight * loss_rtd

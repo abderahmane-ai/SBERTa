@@ -33,6 +33,7 @@ venv.bak/
 # Project Specific
 corpus/
 data/
+data_strategy/
 runs/
 *.model
 *.vocab
