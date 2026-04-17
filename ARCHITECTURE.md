@@ -6,13 +6,12 @@
 
 ## 1. Core Design Philosophy
 
-SBERTa makes three linguistic phenomena explicit architectural components:
+SBERTa makes two linguistic phenomena explicit architectural components:
 
 1. **Language identity** — soft distributions over $K$ language prototypes
 2. **Language boundaries** — continuous switch magnitudes between consecutive tokens
-3. **Language interactions** — per-head compatibility matrices governing cross-language attention
 
-All components are learned end-to-end without hardcoded language labels, making the architecture applicable to any code-switching scenario.
+Both components are learned end-to-end without hardcoded language labels, making the architecture applicable to any code-switching scenario. The encoder's multi-layer self-attention mechanism refines language understanding through contextual processing.
 
 ---
 
@@ -36,8 +35,8 @@ $$\tau = \exp(\log \tau), \quad \log \tau \in \mathbb{R}$$
 
 **Properties:**
 - Computed before contextual processing (no circular dependency)
-- Fast but potentially ambiguous for Latin-script tokens
-- Used for embedding augmentation
+- Used for embedding augmentation **and** attention biases — $p^{(0)}$ is the single language signal throughout the entire model
+- The encoder's multi-layer self-attention refines language understanding through contextual processing without requiring a separate pre-refinement module
 
 ### 2.3 Switch Magnitudes
 
@@ -54,52 +53,15 @@ Since $p^{(0)}_t \in \Delta^K$, the inner product $p^{(0)}_t{}^\top p^{(0)}_{t-1
 
 ---
 
-## 3. Contextual Language Refinement
+## 3. Language-Augmented Embeddings
 
-### 3.1 Motivation
-
-Pre-contextual distributions $p^{(0)}_t$ fail for Latin-script ambiguity:
-- "chat" — French (*cat*) or English (*to chat*)?
-- "la" — French article or Arabic لا?
-- "est" — French or Spanish copula?
-
-Context is required to disambiguate.
-
-### 3.2 Windowed Self-Attention
-
-A lightweight module computes context-refined distributions $p^{(\text{ctx})}_t$ via windowed self-attention over $\mathbf{h}_{\text{base}}$:
-
-$$\mathbf{Q} = \mathbf{W}_Q \mathbf{h}_{\text{base}}, \quad \mathbf{K} = \mathbf{W}_K \mathbf{h}_{\text{base}} \quad \text{where } \mathbf{W}_Q, \mathbf{W}_K \in \mathbb{R}^{(d/4) \times d}$$
-
-$$\text{scores}_{ij} = \frac{\mathbf{Q}_i \mathbf{K}_j^\top}{\sqrt{d/4}} + \text{mask}_{\text{window}}(i, j)$$
-
-where $\text{mask}_{\text{window}}(i, j) = 0$ if $|i - j| \leq w$ (default $w=3$), else $-\infty$.
-
-$$\mathbf{ctx}_t = \sum_{j} \text{softmax}(\text{scores}_{t,:})_j \, \mathbf{h}_{\text{base},j}$$
-
-$$p^{(\text{ctx})}_t = \text{softmax}\left(\frac{\mathbf{W}_{\text{proj}} \mathbf{ctx}_t}{\tau}\right) \in \Delta^K$$
-
-**Properties:**
-- Small projection ($d/4$) keeps computational cost minimal
-- Window size $w=3$ provides local context
-- Shares temperature $\tau$ with pre-contextual distributions
-
-### 3.3 Two-Stage Usage
-
-- **Stage 1 (augmentation):** Use $p^{(0)}_t$ to avoid circular dependency
-- **Stage 2 (attention):** Use $p^{(\text{ctx})}_t$ for accurate language-aware biases
-
----
-
-## 4. Language-Augmented Embeddings
-
-### 4.1 Base Embeddings
+### 3.1 Base Embeddings
 
 $$\mathbf{h}_{\text{base},t} = \mathbf{E}_{\text{tok}}(x_t) + \mathbf{E}_{\text{pos}}(t)$$
 
 No normalization or augmentation yet. Used to compute $p^{(0)}_t$ and $s_t$.
 
-### 4.2 Augmentation
+### 3.2 Augmentation
 
 $$\mathbf{h}^{(0)}_t = \text{LayerNorm}\left(\mathbf{h}_{\text{base},t} + \sum_{k=1}^K p^{(0)}_{t,k} \, \mathbf{e}_k + s_t \, \mathbf{e}_{\text{sw}}\right)$$
 
@@ -113,22 +75,22 @@ where:
 
 ---
 
-## 5. Language-Aware Attention
+## 4. Language-Aware Attention
 
-### 5.1 Attention Score Computation
+### 4.1 Attention Score Computation
 
 Standard transformer attention with two additive language-aware biases:
 
-$$\text{score}_h(i, j) = \frac{\mathbf{Q}_{h,i} \mathbf{K}_{h,j}^\top}{\sqrt{d_h}} + p^{(\text{ctx})}_i{}^\top \mathbf{C}_h \, p^{(\text{ctx})}_j + \gamma \, s_j$$
+$$\text{score}_h(i, j) = \frac{\mathbf{Q}_{h,i} \mathbf{K}_{h,j}^\top}{\sqrt{d_h}} + p^{(0)}_i{}^\top \mathbf{C}_h \, p^{(0)}_j + \gamma \, s_j$$
 
 where:
 - $h \in \{1, \ldots, H\}$ indexes attention heads
 - $\mathbf{C}_h \in \mathbb{R}^{K \times K}$ is a per-head language compatibility matrix
 - $\gamma \in \mathbb{R}$ is a global switch-position bias (shared across heads)
 
-### 5.2 Language Compatibility Bias
+### 4.2 Language Compatibility Bias
 
-$$p^{(\text{ctx})}_i{}^\top \mathbf{C}_h \, p^{(\text{ctx})}_j = \sum_{k=1}^K \sum_{\ell=1}^K p^{(\text{ctx})}_{i,k} \, [\mathbf{C}_h]_{k\ell} \, p^{(\text{ctx})}_{j,\ell}$$
+$$p^{(0)}_i{}^\top \mathbf{C}_h \, p^{(0)}_j = \sum_{k=1}^K \sum_{\ell=1}^K p^{(0)}_{i,k} \, [\mathbf{C}_h]_{k\ell} \, p^{(0)}_{j,\ell}$$
 
 **Properties:**
 - Asymmetric: $[\mathbf{C}_h]_{k\ell} \neq [\mathbf{C}_h]_{\ell k}$ in general
@@ -136,7 +98,7 @@ $$p^{(\text{ctx})}_i{}^\top \mathbf{C}_h \, p^{(\text{ctx})}_j = \sum_{k=1}^K \s
 - Initialized as identity: $\mathbf{C}_h = \mathbf{I}_K$ (equivalent to scalar $\beta_h = 1$)
 - Only $K^2 H$ parameters (192 for base config with $K=4$, $H=12$)
 
-### 5.3 Switch Position Bias
+### 4.3 Switch Position Bias
 
 $$\gamma \, s_j$$
 
@@ -145,19 +107,19 @@ $$\gamma \, s_j$$
 - Initialized to zero (model learns if useful)
 - Shared across all heads
 
-### 5.4 Fixed Language Distributions
+### 4.4 Fixed Language Distributions
 
-Both $p^{(\text{ctx})}_t$ and $s_t$ are computed once and remain fixed across all encoder layers. They are threaded through the encoder but not updated layer-by-layer.
+Both $p^{(0)}_t$ and $s_t$ are computed once from raw base embeddings and remain fixed across all encoder layers. They are threaded through the encoder but not updated layer-by-layer.
 
 ---
 
-## 6. Encoder Architecture
+## 5. Encoder Architecture
 
-### 6.1 Layer Structure
+### 5.1 Layer Structure
 
 Each encoder layer $\ell \in \{1, \ldots, L\}$ applies:
 
-$$\mathbf{H}_{\text{attn}}^{(\ell)} = \text{MultiHeadAttention}(\mathbf{H}^{(\ell-1)}, p^{(\text{ctx})}, s)$$
+$$\mathbf{H}_{\text{attn}}^{(\ell)} = \text{MultiHeadAttention}(\mathbf{H}^{(\ell-1)}, p^{(0)}, s)$$
 
 $$\mathbf{H}_{\text{mid}}^{(\ell)} = \text{LayerNorm}(\mathbf{H}^{(\ell-1)} + \text{Dropout}(\mathbf{H}_{\text{attn}}^{(\ell)}))$$
 
@@ -165,15 +127,15 @@ $$\mathbf{H}^{(\ell)} = \text{LayerNorm}(\mathbf{H}_{\text{mid}}^{(\ell)} + \tex
 
 where $\mathbf{H}^{(0)} = [\mathbf{h}^{(0)}_1, \ldots, \mathbf{h}^{(0)}_T]$ are the augmented embeddings.
 
-### 6.2 Post-LayerNorm
+### 5.2 Post-LayerNorm
 
 SBERTa uses post-LayerNorm (LayerNorm after residual) for stability during ELECTRA-style training.
 
 ---
 
-## 7. ELECTRA-Style Pre-training
+## 6. ELECTRA-Style Pre-training
 
-### 7.1 Architecture Overview
+### 6.1 Architecture Overview
 
 **Generator** (small):
 - Hidden size: $d_{\text{gen}} = d / 4$
@@ -185,7 +147,7 @@ SBERTa uses post-LayerNorm (LayerNorm after residual) for stability during ELECT
 - Full architecture ($d$, $H$, $L$)
 - Binary classification head: $\mathbb{R}^d \to \mathbb{R}$
 
-### 7.2 Switch-Span Masking
+### 6.2 Switch-Span Masking
 
 Instead of random 15% token masking, SBERTa masks entire language-homogeneous spans:
 
@@ -195,7 +157,7 @@ Instead of random 15% token masking, SBERTa masks entire language-homogeneous sp
 
 **Rationale:** Forces generator to reconstruct language segments from cross-language context, directly targeting code-switching.
 
-### 7.3 Training Flow
+### 6.3 Training Flow
 
 1. Compute $p^{(0)}_t$ from original (unmasked) input
 2. Apply switch-span masking using $p^{(0)}_t$
@@ -205,9 +167,9 @@ Instead of random 15% token masking, SBERTa masks entire language-homogeneous sp
 
 ---
 
-## 8. Training Objectives
+## 7. Training Objectives
 
-### 8.1 Generator Loss
+### 7.1 Generator Loss
 
 Masked language modeling on masked spans only:
 
@@ -215,7 +177,7 @@ $$\mathcal{L}_{\text{gen}} = -\frac{1}{|\mathcal{M}|} \sum_{t \in \mathcal{M}} \
 
 where $\mathcal{M}$ is the set of masked positions.
 
-### 8.2 Discriminator Loss (RTD)
+### 7.2 Discriminator Loss (RTD)
 
 Binary cross-entropy at every real (non-padding) token:
 
@@ -228,7 +190,7 @@ where:
 
 **Key advantage:** Supervises all $T$ positions, not just $\approx 0.15T$ masked positions. Provides 6-7× more gradient signal than vanilla MLM.
 
-### 8.3 Temporal Stickiness Loss (Unsupervised)
+### 7.3 Temporal Stickiness Loss (Unsupervised)
 
 Penalises the mean switch magnitude over real consecutive token boundaries:
 
@@ -240,38 +202,39 @@ where $\mathcal{B}$ is the set of consecutive real-token boundary pairs (padding
 
 **Purpose:** Forces prototypes to self-organise into long, linguistically coherent spans rather than flipping per-token. No external labels or fastText model required — the model discovers language boundaries purely from the temporal structure of the data.
 
-### 8.4 Per-Token Prototype Commitment Loss ($\mathcal{L}_{\text{sharp}}$)
+### 7.4 Prototype Diversity Loss
 
-Minimise per-token assignment entropy over real (non-pad) tokens:
+Margin-based repulsion loss to prevent prototype collapse:
 
-$$\mathcal{L}_{\text{sharp}} = -\mathbb{E}_t\left[\sum_{k=1}^{K} p^{(0)}_{t,k} \log p^{(0)}_{t,k}\right]$$
+$$\mathcal{L}_{\text{div}} = \frac{1}{\binom{K}{2}} \sum_{i=1}^{K-1} \sum_{j=i+1}^K \left(\text{ReLU}\!\left(\frac{\boldsymbol{\ell}_i^\top \boldsymbol{\ell}_j}{\|\boldsymbol{\ell}_i\| \|\boldsymbol{\ell}_j\|} + m\right)\right)^2, \quad m = 0.1$$
 
-**Purpose:** Forces each token to commit sharply to one prototype rather than hedging probability mass uniformly across $K$ languages. Only the per-token entropy term is used — the batch-mean entropy (DINO-style balance term) is intentionally omitted to preserve the natural 65/35 Darija-French corpus imbalance.
+The margin $m=0.1$ means the loss fires even when prototypes are near-orthogonal ($\cos \approx 0$), providing a constant repulsion gradient from step 0. This fixes the timing asymmetry where a pure $\cos^2$ formulation produces zero gradient at orthogonal initialisation while $\mathcal{L}_{\text{smooth}}$ is already pushing tokens toward shared prototypes.
 
-### 8.5 Prototype Diversity Loss
+**Boundary values:**
+- At perfect orthogonality ($\cos = 0$): loss $= \text{ReLU}(0.1)^2 = 0.01$ per pair
+- At collapse ($\cos = 1$): loss $= \text{ReLU}(1.1)^2 = 1.21$ per pair
+- Only when $\cos < -m$ does the loss reach zero
 
-Minimize pairwise cosine similarities to prevent collapse:
+**Purpose:** Ensures prototypes remain geometrically separated.
 
-$$\mathcal{L}_{\text{div}} = \frac{2}{K(K-1)} \sum_{i=1}^{K-1} \sum_{j=i+1}^K \left(\frac{\boldsymbol{\ell}_i^\top \boldsymbol{\ell}_j}{\|\boldsymbol{\ell}_i\| \|\boldsymbol{\ell}_j\|}\right)^2$$
+### 7.5 Combined Loss
 
-**Purpose:** Ensures prototypes remain geometrically separated. Without this, prototypes can collapse to identical vectors.
-
-### 8.5 Combined Loss
-
-$$\mathcal{L} = \mathcal{L}_{\text{gen}} + w_{\text{rtd}} \mathcal{L}_{\text{RTD}} + \lambda_{\text{smooth}} \cdot w_{\text{curr}} \cdot \mathcal{L}_{\text{smooth}} + \lambda_{\text{sharp}} \mathcal{L}_{\text{sharp}} + \lambda_{\text{div}} \mathcal{L}_{\text{div}}$$
+$$\mathcal{L} = \mathcal{L}_{\text{gen}} + w_{\text{rtd}} \mathcal{L}_{\text{RTD}} + \lambda_{\text{smooth}} \cdot w_{\text{curr}} \cdot \mathcal{L}_{\text{smooth}} + \lambda_{\text{div}} \mathcal{L}_{\text{div}} + \lambda_{\text{balance}} \mathcal{L}_{\text{balance}}$$
 
 **Default weights:**
 - $w_{\text{rtd}} = 50.0$ (ELECTRA standard)
-- $\lambda_{\text{smooth}} = 15.0$ (15:50 ratio vs RTD — sufficient to compete)
-- $\lambda_{\text{sharp}} = 1.0$ (per-token entropy penalty)
-- $\lambda_{\text{div}} = 0.1$
-- $w_{\text{curr}} = 0.05 + 0.95 \times \min(1,\, \text{step} / \texttt{smooth\_warmup\_steps})$, ramps from 0.05 → 1.0 over `smooth_warmup_steps` (default 5,000)
+- $\lambda_{\text{smooth}} = 15.0$ (15:50 ratio vs RTD)
+- $\lambda_{\text{div}} = 1.0$ (conservative starting point; ablate upward if needed)
+- $\lambda_{\text{balance}} = 1.0$ (soft minimum-usage; fires only when prototype usage drops below $1/(K \times 4) = 6.25\%$)
+- $w_{\text{curr}} = 0.05 + 0.95 \times \min(1,\, \text{step} / \texttt{smooth\_warmup\_steps})$, ramps from 0.05 → 1.0 over `smooth_warmup_steps` (default 10,000)
+
+> **Note:** A per-token prototype commitment loss ($\mathcal{L}_{\text{sharp}}$) was considered but is not used. $\mathcal{L}_{\text{smooth}}$ and $\mathcal{L}_{\text{div}}$ together provide sufficient sharpening — explicit per-token entropy minimisation is redundant and can conflict with desirable soft distributions at language boundaries.
 
 ---
 
-## 9. Gradient Flow Analysis
+## 8. Gradient Flow Analysis
 
-### 9.1 What Updates Prototypes
+### 8.1 What Updates Prototypes
 
 **Direct gradients:**
 - $\mathcal{L}_{\text{smooth}}$: Through `get_switch_magnitudes()` → through `get_distributions()` → through $\mathbf{L}$ directly
@@ -281,13 +244,13 @@ $$\mathcal{L} = \mathcal{L}_{\text{gen}} + w_{\text{rtd}} \mathcal{L}_{\text{RTD
 - $\mathcal{L}_{\text{gen}}$: Through embedding augmentation $\sum_k p^{(0)}_{t,k} \mathbf{e}_k$
 - $\mathcal{L}_{\text{RTD}}$: Through embedding augmentation and attention biases
 
-### 9.2 Key Insight
+### 8.2 Key Insight
 
 $\mathcal{L}_{\text{smooth}}$ and $\mathcal{L}_{\text{RTD}}$ apply opposing pressures on the prototypes: RTD rewards semantic discriminability per token while $\mathcal{L}_{\text{smooth}}$ rewards long same-language spans. The tension between these forces drives prototypes toward linguistically meaningful, temporally-sticky clusters — without any external labels.
 
 ---
 
-## 10. Sentence-Level Representations
+## 9. Sentence-Level Representations
 
 SBERTa does not use a [CLS] token. For sentence-level tasks, use **mean pooling**:
 
@@ -302,17 +265,15 @@ where $\mathcal{R}$ is the set of real (non-padding) positions.
 
 ---
 
-## 11. Design Decisions
+## 10. Design Decisions
 
-### 11.1 Why Two-Stage Language Distributions?
+### 10.1 Why a Single Pre-Contextual Language Distribution?
 
-**Problem:** Need language info early (augmentation) but accurate detection requires context.
+**Problem:** Need language information early for embedding augmentation, but naively feeding augmented embeddings back into language detection creates a circular dependency.
 
-**Solution:**
-- $p^{(0)}_t$: Fast, pre-contextual, used for augmentation (avoids circular dependency)
-- $p^{(\text{ctx})}_t$: Accurate, context-refined, used for attention biases
+**Solution:** Compute $p^{(0)}_t$ once from raw base embeddings (tok + pos, no augmentation) and use it everywhere — both for embedding augmentation and for attention biases $\mathbf{C}_h$ and $\gamma$. The encoder's 12 layers of full $T \times T$ self-attention then resolve Latin-script ambiguity (e.g., "chat" = French vs. English) far more powerfully than any separate windowed refinement module, making a two-stage distribution pipeline architecturally redundant.
 
-### 11.2 Why Per-Head Compatibility Matrices?
+### 10.2 Why Per-Head Compatibility Matrices?
 
 **Old design:** Scalar $\beta_h$ per head
 - Symmetric: $\beta_h p_i^\top p_j = \beta_h p_j^\top p_i$
@@ -323,7 +284,7 @@ where $\mathcal{R}$ is the set of real (non-padding) positions.
 - Learns language-specific affinities
 - Only $K^2 H$ parameters (192 for base)
 
-### 11.3 Why ELECTRA-Style RTD?
+### 10.3 Why ELECTRA-Style RTD?
 
 **Vanilla MLM:** Supervises $\approx 15\%$ of tokens per batch
 
@@ -331,21 +292,21 @@ where $\mathcal{R}$ is the set of real (non-padding) positions.
 
 **Result:** 6-7× more training signal for same data budget. ELECTRA matches BERT performance with 1/4 the compute.
 
-### 11.4 Why Switch-Span Masking?
+### 10.4 Why Switch-Span Masking?
 
 **Random masking:** Doesn't target code-switching structure
 
 **Switch-span masking:** Masks entire language segments, forcing reconstruction from cross-language context. Directly targets code-switching objective.
 
-### 11.5 Why Learnable Temperature?
+### 10.5 Why Learnable Temperature?
 
 **Fixed $\tau$:** One size fits all
 
-**Learnable $\tau$:** Model optimizes its own sharpness. Different datasets may need different $\tau$. Stored as $\log \tau$ for unconstrained optimization.
+**Learnable $\tau$:** Model optimizes its own sharpness. Different datasets may need different $\tau$. Stored as $\log \tau$ for unconstrained optimization. Floored at 0.25 to prevent collapse into a state where prototype imbalance recovery becomes impossible.
 
 ---
 
-## 12. Model Configurations
+## 11. Model Configurations
 
 | Config | $d$ | $L$ | $H$ | FFN | Params |
 |--------|-----|-----|-----|-----|--------|
@@ -358,12 +319,12 @@ All configurations use $K=4$ language prototypes by default.
 
 ---
 
-## 13. Summary
+## 12. Summary
 
 SBERTa is a general-purpose code-switching architecture featuring:
 
 1. **Explicit language modeling** via learnable prototypes and soft distributions
-2. **Contextual refinement** to fix Latin-script ambiguity
+2. **Single-stage language routing** — $p^{(0)}$ computed once from raw embeddings is used for both augmentation and attention biases; contextual disambiguation is handled by the encoder's 12 layers of full self-attention
 3. **Efficient pre-training** via ELECTRA-style replaced token detection
 4. **Fully unsupervised routing** via temporal stickiness loss (no external labels or classifiers)
 5. **Language-aware attention** with per-head compatibility matrices

@@ -7,12 +7,11 @@ Pre-training flow (per forward pass):
 
   1.  h_base   = E_tok(x) + E_pos(t)
   2.  p⁽⁰⁾_t  = softmax(h_base · Lᵀ / τ)              [pre-contextual language dist]
-  3.  p⁽ctx⁾_t = ContextualLanguageRefinement(h_base)  [context-refined language dist]
-  4.  s_t      = 1 − p⁽⁰⁾_t ᵀ p⁽⁰⁾_{t−1}, s₁ = 0    [continuous switch magnitude]
-  5.  h⁽⁰⁾    = LN(h_base + Σₖ p⁽⁰⁾_{t,k} eₖ + sₜ · e_sw)
-  6.  Each encoder layer ℓ:
-        S_h(i,j) = (Qᵢ·Kⱼ)/√dₕ + pᵢᵀ Cₕ pⱼ + γ·sⱼ   [Cₕ ∈ ℝ^{K×K} per head]
-        H⁽ˡ⁾   = LN(H + MHA(H, p⁽ctx⁾, s)) + FFN(·))
+  3.  s_t      = 1 − p⁽⁰⁾_t ᵀ p⁽⁰⁾_{t−1}, s₁ = 0    [continuous switch magnitude]
+  4.  h⁽⁰⁾    = LN(h_base + Σₖ p⁽⁰⁾_{t,k} eₖ + sₜ · e_sw)
+  5.  Each encoder layer ℓ:
+        S_h(i,j) = (Qᵢ·Kⱼ)/√dₕ + p⁽⁰⁾ᵢᵀ Cₕ p⁽⁰⁾ⱼ + γ·sⱼ   [Cₕ ∈ ℝ^{K×K} per head]
+        H⁽ˡ⁾   = LN(H + MHA(H, p⁽⁰⁾, s)) + FFN(·))
 
 Pre-training objectives (ELECTRA-style RTD):
   Generator:     SBERTaGenerator (hidden_size // generator_size_divisor) — MLM on
@@ -20,15 +19,14 @@ Pre-training objectives (ELECTRA-style RTD):
   Discriminator: full SBERTa — RTD binary classification at every token position,
                  giving 6-7× more gradient signal than vanilla 15%-masked MLM.
 
-  L = L_gen + w_rtd · L_RTD + λ_smooth · w_curr · L_smooth + λ_sharp · L_sharp + λ_div · L_div
+  L = L_gen + w_rtd · L_RTD + λ_smooth · w_curr · L_smooth + λ_div · L_div + λ_balance · L_balance
 
   L_gen        : generator MLM (span-masked positions only; normalised by n_masked)
   L_RTD        : replaced token detection — supervises every real token position
   L_smooth     : unsupervised temporal stickiness — mean switch magnitude penalised
                  with a curriculum schedule; no external labels required
-  L_sharp      : per-token prototype commitment — minimises assignment entropy so
-                 each token commits to one language rather than hedging uniformly
   L_div        : prototype diversity — prevents prototype collapse
+  L_balance    : soft minimum-usage — rescues dying prototypes below 1/(K*4) usage
 """
 
 from __future__ import annotations
@@ -119,71 +117,16 @@ def _switch_span_mask(
 
 
 # ─── Contextual Language Refinement ──────────────────────────────────────────
-
-
-class ContextualLanguageRefinement(nn.Module):
-    """
-    Stage-2 context-aware language distribution computation.
-
-    A lightweight windowed self-attention module (±window tokens) over h_base
-    that produces context-refined language distributions p⁽ctx⁾. These fix the
-    fundamental weakness of purely pre-contextual prototype assignment, which
-    fails for Latin-script ambiguity:
-
-      'chat'  — French (cat) or English depending on surrounding words
-      'la'    — French negation or Arabic لا depending on script context
-      'est'   — French or Spanish copula
-      'ma'    — French possessive or Arabic particle
-      Arabizi tokens: context-dependent relative to adjacent Arabic/French spans
-
-    p⁽ctx⁾ is used for the attention compatibility biases (Cₕ and γ) in every
-    encoder layer. Embedding augmentation still uses the pre-contextual p⁽⁰⁾ to
-    avoid a circular dependency.
-    """
-
-    def __init__(self, config: SBERTaConfig, window: int = 3) -> None:
-        super().__init__()
-        d: int = config.hidden_size
-        d_small: int = d // 4             # lightweight projection keeps the module cheap
-        self.window: int = window
-        self.scale: float = math.sqrt(d_small)
-
-        self.W_Q: nn.Linear = nn.Linear(d, d_small, bias=False)
-        self.W_K: nn.Linear = nn.Linear(d, d_small, bias=False)
-        self.proj: nn.Linear = nn.Linear(d, config.num_languages, bias=False)
-
-    def _windowed_mask(self, T: int, device: torch.device) -> torch.Tensor:
-        """
-        Additive attention mask: 0.0 inside ±window, −inf outside.
-        Shape: (T, T).
-        """
-        positions = torch.arange(T, device=device)
-        dist = (positions.unsqueeze(0) - positions.unsqueeze(1)).abs()  # (T, T)
-        return torch.where(
-            dist <= self.window,
-            torch.zeros(T, T, device=device),
-            torch.full((T, T), float("-inf"), device=device),
-        )
-
-    def forward(self, h_base: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            h_base: (B, T, d) — raw base embeddings before language augmentation
-            tau:    scalar temperature tensor (LanguagePrototypes.tau)
-        Returns:
-            p_ctx: (B, T, K) — context-refined language distributions
-        """
-        T = h_base.size(1)
-        Q = self.W_Q(h_base)             # (B, T, d_small)
-        K_ = self.W_K(h_base)            # (B, T, d_small)
-
-        scores = (
-            torch.bmm(Q, K_.transpose(1, 2)) / self.scale
-            + self._windowed_mask(T, h_base.device).unsqueeze(0)
-        )                                # (B, T, T)
-
-        ctx = torch.bmm(F.softmax(scores, dim=-1), h_base)  # (B, T, d)
-        return F.softmax(self.proj(ctx) / tau, dim=-1)       # (B, T, K)
+# REMOVED: ContextualLanguageRefinement class
+#
+# Rationale: The 12-layer encoder with full T×T self-attention resolves
+# Latin-script ambiguity (e.g., "chat" = French vs English) far more
+# powerfully than a ±3 token windowed module. The encoder learns to
+# disambiguate through its own attention mechanism, making a separate
+# pre-refinement step architecturally redundant.
+#
+# Simplification: Feed p⁽⁰⁾ directly to C_h and γ. The encoder refines
+# language understanding through its 12 layers of contextual processing.
 
 
 # ─── Language Prototypes ──────────────────────────────────────────────────────
@@ -586,18 +529,18 @@ class SBERTaGenerator(nn.Module):
 
 class SBERTaModel(nn.Module):
     """
-    Bare SBERTa encoder with two-stage language distribution computation.
+    Bare SBERTa encoder with single-stage language distribution computation.
 
-    Stage 1 (pre-contextual): p⁽⁰⁾_t from raw h_base — used for embedding
-    augmentation; avoids circular dependency.
+    p⁽⁰⁾_t is computed from raw h_base (tok + pos) and used for:
+      · Embedding augmentation (avoids circular dependency)
+      · Attention compatibility biases C_h and γ (encoder refines through context)
 
-    Stage 2 (context-refined): p⁽ctx⁾_t from windowed attention over h_base —
-    used for attention compatibility biases Cₕ and γ; fixes Latin-script
-    ambiguity where p⁽⁰⁾ is unreliable.
+    The encoder's 12 layers of full self-attention resolve ambiguity through
+    contextual processing, making a separate windowed refinement step redundant.
 
     Typical fine-tuning usage:
         model = SBERTaModel(config)
-        H, p_ctx, s = model(input_ids, attention_mask)
+        H, p0, s = model(input_ids, attention_mask)
         sentence_repr = _masked_mean_pool(H, attention_mask)
     """
 
@@ -605,7 +548,6 @@ class SBERTaModel(nn.Module):
         super().__init__()
         self.config: SBERTaConfig = config
         self.prototypes: LanguagePrototypes = LanguagePrototypes(config)
-        self.refinement: ContextualLanguageRefinement = ContextualLanguageRefinement(config)
         self.embeddings: SBERTaEmbeddings = SBERTaEmbeddings(config)
         self.layers: nn.ModuleList = nn.ModuleList(
             [SBERTaLayer(config) for _ in range(config.num_hidden_layers)]
@@ -621,28 +563,26 @@ class SBERTaModel(nn.Module):
             input_ids:      (B, T)
             attention_mask: (B, T) binary — 1 for real tokens, 0 for padding
         Returns:
-            H:     (B, T, d) — final encoder hidden states
-            p_ctx: (B, T, K) — context-refined language distributions
-            s:     (B, T)    — switch magnitudes (derived from pre-contextual p⁽⁰⁾)
+            H:  (B, T, d) — final encoder hidden states
+            p0: (B, T, K) — pre-contextual language distributions
+            s:  (B, T)    — switch magnitudes
         """
         # Stage 1: tok + pos (no LN, no language augmentation yet)
         h_base = self.embeddings.get_base(input_ids)             # (B, T, d)
 
-        # Stage 2a: pre-contextual language assignments + switch magnitudes
+        # Stage 2: pre-contextual language assignments + switch magnitudes
         p0 = self.prototypes.get_distributions(h_base)           # (B, T, K)
         s = self.prototypes.get_switch_magnitudes(p0)            # (B, T)
-
-        # Stage 2b: context-refined language distributions (windowed attention)
-        p_ctx = self.refinement(h_base, self.prototypes.tau)     # (B, T, K)
 
         # Stage 3: augmented h⁽⁰⁾ uses p⁽⁰⁾ — circular-dependency free
         H = self.embeddings.augment(h_base, p0, s)               # (B, T, d)
 
-        # Stage 4: encoder stack — attention biases use p⁽ctx⁾
+        # Stage 4: encoder stack — attention biases use p⁽⁰⁾
+        # The encoder refines language understanding through contextual processing
         for layer in self.layers:
-            H = layer(H, p_ctx, s, attention_mask)
+            H = layer(H, p0, s, attention_mask)
 
-        return H, p_ctx, s
+        return H, p0, s
 
 
 # ─── Pre-training Wrapper ─────────────────────────────────────────────────────
@@ -750,7 +690,7 @@ class SBERTaForPreTraining(nn.Module):
         is_replaced = (corrupted_ids != input_ids).float()         # (B, T)
 
         # ── Step 3: discriminator forward on corrupted sequence ───────────
-        H, p_ctx, s = self.sberta(corrupted_ids, attention_mask)
+        H, p0, s = self.sberta(corrupted_ids, attention_mask)
 
         # ── L_gen (generator MLM) ────────────────────────────────────────
         gen_labels = input_ids.new_full(input_ids.shape, -100)
@@ -803,15 +743,11 @@ class SBERTaForPreTraining(nn.Module):
             loss_smooth = input_ids.new_zeros(())
 
         # ── L_sharp (per-token prototype commitment) ──────────────────────
-        # Minimise per-token assignment entropy over real (non-pad) tokens.
-        # Forces each token to commit sharply to one prototype rather than
-        # maintaining a near-uniform distribution across K.
-        # This is the safe half of the information-theoretic objective:
-        # we do NOT add the batch-balance term (H of the mean distribution)
-        # which would force equal usage across K and would break the 65/35
-        # Darija-French corpus ratio by hallucinating language boundaries.
-        p0_real = p_pre[real]                                # (N_real, K)
-        loss_sharp = -(p0_real * (p0_real + 1e-9).log()).sum(dim=-1).mean()
+        # REMOVED: Set to zero. L_smooth + L_div provide sufficient sharpening.
+        # L_smooth creates coherent spans, L_div increases inter-prototype
+        # distance (implicitly sharpening softmax), making explicit per-token
+        # entropy minimization redundant and potentially conflicting at boundaries.
+        loss_sharp = input_ids.new_zeros(())
 
         # ── L_div ────────────────────────────────────────────────────────
         loss_div = self.sberta.prototypes.diversity_loss()
@@ -820,9 +756,10 @@ class SBERTaForPreTraining(nn.Module):
         # Fires only when a prototype's mean usage drops below min_usage
         # (1 / K*4 = 6.25% for K=4).  Does NOT force equal distribution —
         # it only rescues dying prototypes, preserving the natural 65/35
-        # corpus ratio.  Complements L_sharp which rewards confident
-        # assignments without caring which prototype receives them.
+        # corpus ratio.  Complements L_div which pushes prototypes apart
+        # geometrically without caring about usage balance.
         _min_usage: float = 1.0 / (self.config.num_languages * 4)   # 6.25% for K=4
+        p0_real = p_pre[real]                                        # (N_real, K)
         mean_usage = p0_real.mean(dim=0)                             # (K,)
         loss_balance = F.relu(_min_usage - mean_usage).mean()
 
@@ -833,7 +770,6 @@ class SBERTaForPreTraining(nn.Module):
             + cfg.rtd_weight * loss_rtd
             + cfg.lambda_smooth * smooth_weight * loss_smooth
             + cfg.lambda_div * loss_div
-            + cfg.lambda_sharp * loss_sharp
             + cfg.lambda_balance * loss_balance
         )
 
@@ -848,7 +784,7 @@ class SBERTaForPreTraining(nn.Module):
             "loss_balance":      loss_balance.item(),
             "rtd_acc":           rtd_acc,
             "n_masked":          n_masked,
-            "language_probs":    p_ctx,    # (B, T, K) — context-refined, for monitoring
+            "language_probs":    p0,       # (B, T, K) — pre-contextual, for monitoring
             "switch_magnitudes": s,        # (B, T) — from corrupted input, for analysis
         }
 

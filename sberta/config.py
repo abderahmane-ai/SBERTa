@@ -33,11 +33,10 @@ class SBERTaConfig:
     # ── Pre-training (ELECTRA-style RTD) ──────────────────────────────────
     mlm_probability: float = 0.15   # fraction of tokens targeted by span masking (generator)
     rtd_weight: float = 50.0        # discriminator RTD loss coefficient (anchor - main training signal)
-    generator_size_divisor: int = 2   # generator hidden_size = hidden_size // this (d/2 for harder fakes)
-    lambda_smooth: float = 5.0        # temporal stickiness (was 15.0 - reduced 3× to prevent over-clustering)
-    smooth_warmup_steps: int = 10_000  # steps for full smooth curriculum ramp (was 5k - doubled for stability)
-    lambda_div: float = 5.0          # prototype diversity (was 0.1 - increased 50× to prevent collapse)
-    lambda_sharp: float = 0.5        # per-token commitment (was 1.0 - reduced to allow softer assignments)
+    generator_size_divisor: int = 4   # generator hidden_size = hidden_size // this (ELECTRA standard: d/4)
+    lambda_smooth: float = 15.0       # temporal stickiness (15:50 ratio vs RTD)
+    smooth_warmup_steps: int = 10_000  # steps for full smooth curriculum ramp (doubled from 5k for stability)
+    lambda_div: float = 1.0          # prototype diversity (start conservative, ablate upward)
     lambda_balance: float = 1.0      # soft minimum-usage: rescues dying prototypes below 1/(K*4) usage
 
     # ────────────────────────────────────────────────────────────────────
