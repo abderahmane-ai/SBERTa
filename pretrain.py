@@ -890,7 +890,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--runs-dir",         type=str,   default="runs")
     p.add_argument("--checkpoint-every", type=int,   default=5_000)
     p.add_argument("--log-every",        type=int,   default=100)
-    p.add_argument("--num-workers",      type=int,   default=4)
+    p.add_argument("--num-workers",      type=int,   default=0)
     return p.parse_args()
 
 
