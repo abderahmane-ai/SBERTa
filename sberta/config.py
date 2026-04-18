@@ -22,26 +22,25 @@ class SBERTaConfig:
     layer_norm_eps: float = 1e-12
 
     # ── Code-switching ────────────────────────────────────────────────────
-    num_languages: int = 4          # K — number of prototype languages
-    proto_temperature: float = 0.5  # τ fixed value (prevents collapse from over-sharpening)
-    learnable_temperature: bool = False  # τ fixed (was True, caused collapse to 0.39)
+    num_languages: int = 4
+    proto_temperature: float = 0.5
+    learnable_temperature: bool = False
 
     # ── Regularisation ────────────────────────────────────────────────────
     hidden_dropout_prob: float = 0.1
     attention_probs_dropout_prob: float = 0.1
 
     # ── Pre-training (ELECTRA-style RTD) ──────────────────────────────────
-    mlm_probability: float = 0.15      # fraction of tokens targeted by span masking (generator)
-    rtd_weight: float = 50.0           # discriminator RTD loss coefficient (anchor - main training signal)
-    generator_size_divisor: int = 4    # generator hidden_size = hidden_size // this (ELECTRA standard: d/4)
-    lambda_smooth: float = 8.0         # temporal stickiness weight (reduced from 15.0 until div/balance are fixed)
-    smooth_warmup_ratio: float = 0.15  # smooth curriculum ramp duration as fraction of total steps (15% for gradual ramp)
-    smooth_weight_min: float = 0.05    # smooth curriculum weight at end of burn-in (ramps to 1.0 over warmup)
-    burnin_ratio: float = 0.05         # burn-in duration as fraction of total steps (5%; L_smooth=0, only L_div)
-    lambda_div: float = 5.0            # prototype diversity weight (increased from 1.0 with new log-barrier loss)
-    div_margin: float = 0.1            # [DEPRECATED] cosine margin for old diversity loss; kept for config compatibility
-    lambda_balance: float = 30.0       # soft minimum-usage weight: needs 30× increase to compete with smooth
-    balance_min_usage_factor: float = 0.5  # per-prototype usage floor = factor/K (0.5 → 50% of uniform = 12.5% for K=4)
+    mlm_probability: float = 0.15
+    rtd_weight: float = 50.0
+    generator_size_divisor: int = 4
+    lambda_smooth: float = 8.0
+    smooth_warmup_ratio: float = 0.15
+    smooth_weight_min: float = 0.05
+    burnin_ratio: float = 0.05
+    lambda_div: float = 5.0
+    lambda_balance: float = 30.0
+    balance_min_usage_factor: float = 0.5
 
     # ────────────────────────────────────────────────────────────────────
     def __post_init__(self) -> None:

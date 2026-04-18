@@ -153,12 +153,7 @@ class LanguagePrototypes(nn.Module):
 
     @property
     def tau(self) -> torch.Tensor:
-        """Always-positive temperature: τ = exp(log_τ), floored at 0.25.
-
-        The floor prevents the model from sharpening past the point where
-        prototype imbalance recovery becomes impossible. Without it, a
-        collapsed prototype at very low τ mathematically locks others out.
-        """
+        """Always-positive temperature: τ = exp(log_τ), floored at 0.25."""
         return self.log_tau.exp().clamp(min=0.25)
 
     def get_distributions(self, h: torch.Tensor) -> torch.Tensor:
@@ -190,27 +185,14 @@ class LanguagePrototypes(nn.Module):
 
     def diversity_loss(self) -> torch.Tensor:
         """
-        Exponential repulsion loss that never reaches zero:
-            L_div = (1/pairs) · Σ_{i<j} (exp(cos(ℓᵢ, ℓⱼ)) - exp(-1))
-
+        Exponential repulsion loss that never reaches zero.
         Always positive, always has gradient, exponentially steeper near collapse.
-        Baseline exp(-1) ≈ 0.368 so loss → 0 only at perfect anti-parallel (cos = -1).
-        
-        Values at observed states:
-        - cos = -0.10 (normal):     0.537 (constant repulsion)
-        - cos =  0.00 (orthogonal): 0.632 (still firing)
-        - cos = -0.40 (collapse):   0.303 (weaker, allows separation)
-        - cos = +0.80 (alignment):  1.858 (strong repulsion)
-        
-        With λ_div=5.0, gives ~2.7 constant force during normal operation,
-        comparable to smooth at 8.0 × 0.5 × 0.75 ≈ 3.0.
         """
         L_n = F.normalize(self.prototypes, dim=-1)             # (K, d)
         cos = L_n @ L_n.T                                      # (K, K)
         mask = torch.triu(
             torch.ones(self.K, self.K, device=cos.device), diagonal=1
         )
-        # exp(cos) - exp(-1): always positive, always has gradient
         repulsion = torch.exp(cos) - math.exp(-1.0)
         return (repulsion * mask).sum() / (self.K * (self.K - 1) / 2.0)
 
@@ -723,19 +705,12 @@ class SBERTaForPreTraining(nn.Module):
                 loss_smooth = input_ids.new_zeros(())
 
         # ── L_sharp (per-token prototype commitment) ──────────────────────
-        # Placeholder for future experiments. Currently unused — L_smooth and
-        # L_div together provide sufficient sharpening without explicit per-token
-        # entropy minimization, which can conflict with soft distributions at
-        # language boundaries.
         loss_sharp = input_ids.new_zeros(())
 
         # ── L_div ────────────────────────────────────────────────────────
         loss_div = self.sberta.prototypes.diversity_loss()
 
         # ── L_balance (soft minimum-usage) ───────────────────────────────
-        # Floor = factor/K so the threshold scales with the number of prototypes.
-        # factor=0.25 means each prototype must capture at least 25% of its
-        # fair share (1/K), regardless of what K is set to.
         p0_real = p_pre[real]                                        # (N_real, K)
         mean_usage = p0_real.mean(dim=0)                             # (K,)
         min_usage = cfg.balance_min_usage_factor / cfg.num_languages
