@@ -301,9 +301,9 @@ class SBERTaAttention(nn.Module):
         self.W_O: nn.Linear = nn.Linear(d, d)
 
         # Per-head K×K language compatibility matrix Cₕ ∈ ℝ^{H×K×K}
-        # Identity init → equivalent to scalar β_h = 1 at the start of training
+        # Identity init + small noise breaks symmetry so heads specialize from step 1
         self.compat: nn.Parameter = nn.Parameter(
-            torch.eye(K).unsqueeze(0).expand(H, -1, -1).clone()  # (H, K, K)
+            torch.eye(K).unsqueeze(0).expand(H, -1, -1).clone() + 0.01 * torch.randn(H, K, K)
         )
         # Global switch-position scalar γ, init to zero
         self.gamma: nn.Parameter = nn.Parameter(torch.zeros(1))
@@ -598,7 +598,8 @@ class SBERTaForPreTraining(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,   # (B, T) binary
         segment_ids: Optional[torch.Tensor] = None,      # (B, T) document boundaries
         global_step: int = 0,                            # current training step (curriculum)
-        total_steps: int = 1,                            # total training steps (for ratio-based curriculum)
+        total_steps: int = 0,                            # total training steps (for ratio-based curriculum)
+        usage_ema: Optional[torch.Tensor] = None,        # (K,) EMA-tracked global prototype usage
     ) -> dict:
         """
         Args:
@@ -609,7 +610,10 @@ class SBERTaForPreTraining(nn.Module):
                             If None, assumes single document per sequence.
             global_step:    current optimiser step; used for curriculum schedule.
             total_steps:    total training steps; used to compute absolute burn-in
-                            and warmup durations from config ratios.
+                            and warmup durations from config ratios. If 0, burn-in
+                            and warmup are disabled (for fine-tuning/inference).
+            usage_ema:      (K,) EMA-tracked global prototype usage from trainer.
+                            If provided, balance loss uses this instead of batch stats.
         Returns:
             dict with 'loss' (scalar) and per-component .item() loss values.
         """
@@ -679,11 +683,12 @@ class SBERTaForPreTraining(nn.Module):
         # L_smooth is gated off for the first burnin_ratio*total_steps so
         # prototypes can separate geometrically (driven by L_div alone) before
         # temporal stickiness starts pulling them together.
-        burnin_steps = int(cfg.burnin_ratio * total_steps)
+        # If total_steps=0 (fine-tuning/inference), disable curriculum.
+        burnin_steps = int(cfg.burnin_ratio * total_steps) if total_steps > 0 else 0
         in_burnin = global_step < burnin_steps
 
         # ── L_smooth (unsupervised temporal stickiness) ───────────────────
-        if in_burnin:
+        if in_burnin or total_steps == 0:
             smooth_weight = 0.0
             loss_smooth = input_ids.new_zeros(())
         else:
@@ -711,10 +716,18 @@ class SBERTaForPreTraining(nn.Module):
         loss_div = self.sberta.prototypes.diversity_loss()
 
         # ── L_balance (soft minimum-usage) ───────────────────────────────
-        p0_real = p_pre[real]                                        # (N_real, K)
-        mean_usage = p0_real.mean(dim=0)                             # (K,)
+        p0_real = p_pre[real]
+        mean_usage_batch = p0_real.mean(dim=0)
         min_usage = cfg.balance_min_usage_factor / cfg.num_languages
-        loss_balance = F.relu(min_usage - mean_usage).mean()
+        
+        if usage_ema is not None:
+            is_dying = (usage_ema.detach() < min_usage)
+            if is_dying.any():
+                loss_balance = F.relu(min_usage - mean_usage_batch[is_dying]).mean()
+            else:
+                loss_balance = mean_usage_batch.new_zeros(())
+        else:
+            loss_balance = F.relu(min_usage - mean_usage_batch).mean()
 
         # ── Combined loss ─────────────────────────────────────────────────
         loss = (

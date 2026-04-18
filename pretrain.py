@@ -340,6 +340,7 @@ def save_checkpoint(
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     config,
     metrics: dict,
+    ema_usage: Optional[torch.Tensor] = None,
 ) -> Path:
     """
     Save a full training checkpoint and update the `latest` pointer file.
@@ -358,6 +359,8 @@ def save_checkpoint(
     (ckpt_dir / "metrics.json").write_text(
         json.dumps(metrics, indent=2), encoding="utf-8"
     )
+    if ema_usage is not None:
+        torch.save(ema_usage.cpu(), ckpt_dir / "ema_usage.pt")
     (run_dir / "latest").write_text(str(ckpt_dir), encoding="utf-8")
 
     log.info("Checkpoint saved → %s", ckpt_dir)
@@ -370,23 +373,24 @@ def load_latest_checkpoint(
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     device: torch.device,
-) -> int:
+) -> tuple[int, Optional[Path]]:
     """
     Load the most recent checkpoint if one exists.
 
     Returns:
-        The global step to resume from, or 0 if no checkpoint is found.
+        (global_step, ckpt_dir): The global step to resume from (0 if no checkpoint),
+                                  and the checkpoint directory path (None if no checkpoint).
     """
     latest_file = run_dir / "latest"
     if not latest_file.exists():
-        return 0
+        return 0, None
 
     ckpt_dir = Path(latest_file.read_text(encoding="utf-8").strip())
     if not ckpt_dir.exists():
         log.warning(
             "Latest checkpoint path no longer exists: %s — starting fresh.", ckpt_dir
         )
-        return 0
+        return 0, None
 
     model.load_state_dict(
         torch.load(ckpt_dir / "model.pt",     map_location=device, weights_only=True)
@@ -401,7 +405,8 @@ def load_latest_checkpoint(
     metrics = json.loads((ckpt_dir / "metrics.json").read_text(encoding="utf-8"))
     step = int(metrics.get("step", 0))
     log.info("Resumed from %s (step %d)", ckpt_dir, step)
-    return step
+    return step, ckpt_dir
+
 
 
 # ─── Training Loop ────────────────────────────────────────────────────────────
@@ -555,6 +560,17 @@ def train(
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log.info("Trainable parameters: %.1f M", n_params / 1e6)
 
+    # ── EMA-tracked prototype usage ───────────────────────────────────────
+    # Exponential moving average of per-prototype usage — robust to batch variance.
+    # Decay=0.999 means the EMA has an effective window of ~1000 steps,
+    # reflecting global distribution rather than per-batch noise.
+    ema_usage: torch.Tensor = torch.full(
+        (config.num_languages,),
+        1.0 / config.num_languages,
+        device=device,
+    )
+    EMA_DECAY: float = 0.999
+
     # ── Mixed precision ────────────────────────────────────────────────────
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler(device=device.type, enabled=use_amp)
@@ -601,9 +617,18 @@ def train(
     # ── Run directory + optional resume ───────────────────────────────────
     run_dir = Path(runs_dir) / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
-    global_step = load_latest_checkpoint(
+    global_step, ckpt_dir = load_latest_checkpoint(
         run_dir, model, optimizer, scheduler, device
     )
+
+    # Restore EMA usage if resuming from checkpoint
+    if ckpt_dir is not None:
+        ema_ckpt = ckpt_dir / "ema_usage.pt"
+        if ema_ckpt.exists():
+            ema_usage = torch.load(ema_ckpt, map_location=device, weights_only=True)
+            log.info("EMA usage restored: %s", "  ".join(
+                f"p{i}={ema_usage[i].item()*100:.1f}%" for i in range(config.num_languages)
+            ))
 
     # ── Training state ────────────────────────────────────────────────────
     model.train()
@@ -662,6 +687,7 @@ def train(
                     attention_mask=attention_mask,
                     global_step=global_step,
                     total_steps=total_steps,
+                    usage_ema=ema_usage.detach(),
                 )
                 loss_scaled = out["loss"] / grad_accum
 
@@ -677,6 +703,10 @@ def train(
             # Prototype usage and switch stats (no grad needed)
             with torch.no_grad():
                 real_mask = attention_mask.bool()
+
+                # Update EMA using soft mean usage from this batch
+                batch_usage = out["language_probs"][real_mask].mean(dim=0)  # (K,) soft
+                ema_usage = EMA_DECAY * ema_usage + (1.0 - EMA_DECAY) * batch_usage
 
                 # Dominant prototype per real token — from context-refined p_ctx
                 dominant = out["language_probs"].argmax(-1)[real_mask]  # (N_real,)
@@ -804,6 +834,9 @@ def train(
                 steps_per_sec, tok_per_sec,
             )
             log.info("  prototypes : %s  entropy=%.1f%%", proto_str, entropy_pct)
+            log.info("  ema_usage  : %s", "  ".join(
+                f"p{i}={ema_usage[i].item()*100:.1f}%" for i in range(config.num_languages)
+            ))
             log.info("  cosines    : %s", cos_str)
             log.info("  switch mag : mean=%s  max=%s", sw_mean_str, sw_max_str)
 
@@ -841,6 +874,7 @@ def train(
                 run_dir, global_step,
                 model, optimizer, scheduler,
                 config, last_metrics,
+                ema_usage=ema_usage,
             )
 
     log.info("Training complete at step %d.", global_step)

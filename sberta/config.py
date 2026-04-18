@@ -33,7 +33,7 @@ class SBERTaConfig:
     # ── Pre-training (ELECTRA-style RTD) ──────────────────────────────────
     mlm_probability: float = 0.15
     rtd_weight: float = 50.0
-    generator_size_divisor: int = 4
+    generator_size_divisor: int = 2
     lambda_smooth: float = 8.0
     smooth_warmup_ratio: float = 0.15
     smooth_weight_min: float = 0.05
