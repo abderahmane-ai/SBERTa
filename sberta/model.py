@@ -15,23 +15,22 @@ Pre-training flow (per forward pass):
 
 Pre-training objectives (ELECTRA-style RTD):
   Generator:     SBERTaGenerator (hidden_size // generator_size_divisor) — MLM on
-                 switch-span-masked input; proposes plausible token replacements.
+                 geometrically-masked spans; proposes plausible token replacements.
   Discriminator: full SBERTa — RTD binary classification at every token position,
                  giving 6-7× more gradient signal than vanilla 15%-masked MLM.
 
-  L = L_gen + w_rtd · L_RTD + λ_smooth · L_smooth + λ_div · L_div
+  L = L_gen + w_rtd · L_RTD + λ_smooth · L_smooth + λ_cluster · L_cluster
 
   L_gen        : generator MLM (span-masked positions only; normalised by n_masked)
   L_RTD        : replaced token detection — supervises every real token position
   L_smooth     : unsupervised temporal stickiness — mean switch magnitude penalised
-                 at within-script boundaries (cross-script transitions excluded via
-                 Unicode script prior); no curriculum needed
-  L_div        : prototype diversity — disabled (lambda_div=0.0) with script prior;
-                 kept for future K>2 experiments
+                 at all within-sequence boundaries; no cross-script exclusion needed
+  L_cluster    : Sinkhorn-Knopp prototype equipartition — mathematically guarantees
+                 K distinct clusters without collapse, burn-in, or external signals
 
-The Unicode script prior (script_prior_weight=0.5) blends learned prototype
-distributions with hard Unicode script signals, providing strong separation from
-step 1 and eliminating the need for burn-in curricula or balance losses.
+The model is fully zero-knowledge: no Unicode priors, no script IDs, no dictionaries.
+Language structure emerges purely from the MLM distributional objective, stabilised
+by the Sinkhorn clustering loss. Works on any K-language mixture.
 """
 
 from __future__ import annotations
@@ -44,45 +43,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import SBERTaConfig
-import unicodedata as _unicodedata
-
-def _build_script_ids(
-    vocab_size: int,
-    pieces: list[str],
-) -> torch.Tensor:
-    from collections import Counter
-
-    def _first_script(piece: str) -> Optional[str]:
-        for ch in piece.lstrip("\u2581"):
-            try:
-                name = _unicodedata.name(ch)
-            except ValueError:
-                continue
-            script = name.split()[0]
-            if script in ("DIGIT", "SPACE", "NO-BREAK", "ZERO", "BYTE"):
-                continue
-            return script
-        return None
-
-    script_counts: Counter = Counter()
-    token_scripts: list[Optional[str]] = []
-    for piece in pieces:
-        s = _first_script(piece)
-        token_scripts.append(s)
-        if s is not None:
-            script_counts[s] += 1
-
-    script_to_id: dict[str, int] = {
-        s: i for i, (s, _) in enumerate(script_counts.most_common())
-    }
-
-    script_ids = torch.full((vocab_size,), -1, dtype=torch.long)
-    for token_id, s in enumerate(token_scripts):
-        if s is not None and s in script_to_id:
-            script_ids[token_id] = script_to_id[s]
-
-    return script_ids
-
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -102,68 +62,97 @@ def _masked_mean_pool(H: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return (H * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1.0)
 
 
-def _switch_span_mask(
-    p: torch.Tensor,
+def _geometric_span_mask(
     attention_mask: torch.Tensor,
-    target_mask_prob: float = 0.15,
+    mask_prob: float,
+    geo_p: float,
+    min_len: int,
+    max_len: int,
 ) -> torch.Tensor:
     """
-    Switch-span masking for the ELECTRA generator.
+    Language-agnostic span masking for the ELECTRA generator.
 
-    Groups consecutive tokens with the same dominant language (argmax p) into
-    language-homogeneous spans, then randomly selects whole spans until
-    ~target_mask_prob of real tokens are covered.
+    Span lengths are sampled from Geometric(geo_p) via inverse CDF, giving a
+    mean span of 1/geo_p tokens (5 at default geo_p=0.2). Spans are placed at
+    random non-overlapping positions until mask_prob of real tokens are covered.
 
-    Masking entire spans — rather than random individual tokens — forces the
-    generator to reconstruct a language segment from cross-language context,
-    which directly targets SBERTa's code-switching objective.
+    Completely independent of p⁽⁰⁾ — required for zero-knowledge pre-training
+    where p⁽⁰⁾ carries no meaningful signal at the start of training.
 
     Args:
-        p:                (B, T, K) pre-contextual language distributions
-                          (computed from the original unmasked input)
-        attention_mask:   (B, T) binary — 1 for real tokens, 0 for padding
-        target_mask_prob: target fraction of real tokens to mask
+        attention_mask: (B, T) binary — 1 for real tokens, 0 for padding
+        mask_prob:      target fraction of real tokens to mask
+        geo_p:          geometric distribution parameter (0 < geo_p ≤ 1)
+        min_len:        minimum span length in tokens
+        max_len:        maximum span length in tokens
     Returns:
         span_mask: (B, T) bool — True at positions selected for masking
     """
-    B, T, _ = p.shape
-    lang_ids = p.argmax(dim=-1)                      # (B, T)
-    span_mask = torch.zeros(B, T, dtype=torch.bool, device=p.device)
+    B, T = attention_mask.shape
+    span_mask = torch.zeros(B, T, dtype=torch.bool, device=attention_mask.device)
+    log1mp = math.log(1.0 - geo_p)  # precompute; geo_p is constant
 
     for b in range(B):
         real_len = int(attention_mask[b].sum().item())
         if real_len == 0:
             continue
-        langs = lang_ids[b, :real_len]
 
-        # Span start positions: index 0 always starts a span; later positions
-        # start a span wherever the dominant language changes.
-        is_start = torch.cat([
-            torch.ones(1, dtype=torch.bool, device=p.device),
-            langs[1:] != langs[:-1],
-        ])                                           # (real_len,)
-        starts = is_start.nonzero(as_tuple=True)[0]  # (n_spans,)
-        ends = torch.cat([starts[1:], starts.new_tensor([real_len])])
-
-        target_n  = max(1, int(real_len * target_mask_prob))
-        # Hard cap at 30% to prevent a single dominant-language span from
-        # covering the entire sequence when prototypes collapse.
-        max_mask_n = int(real_len * min(target_mask_prob * 2.0, 0.30))
-        starts_list = starts.tolist()
-        ends_list = ends.tolist()
-
+        target_n = max(1, int(real_len * mask_prob))
         n_masked = 0
-        for idx in torch.randperm(len(starts_list), device=p.device).tolist():
-            if n_masked >= target_n or n_masked >= max_mask_n:
+
+        for start in torch.randperm(real_len, device=attention_mask.device).tolist():
+            if n_masked >= target_n:
                 break
-            s, e = starts_list[idx], ends_list[idx]
-            # Skip spans that would overshoot the hard cap by more than one span
-            if n_masked + (e - s) > max_mask_n:
+            if span_mask[b, start]:
                 continue
-            span_mask[b, s:e] = True
-            n_masked += e - s
+
+            # Inverse CDF of Geometric(geo_p): span_len ~ Geom(geo_p)
+            u = max(torch.rand(1, device=attention_mask.device).item(), 1e-9)
+            raw_len = int(math.ceil(math.log(u) / log1mp))
+            span_len = max(min_len, min(raw_len, max_len))
+            # Clamp to remaining sequence and remaining budget
+            span_len = min(span_len, real_len - start, target_n - n_masked)
+
+            span_mask[b, start : start + span_len] = True
+            n_masked += span_len
 
     return span_mask                                 # (B, T)
+
+
+@torch.no_grad()
+def _sinkhorn(scores: torch.Tensor, epsilon: float, n_iters: int) -> torch.Tensor:
+    """
+    Sinkhorn-Knopp optimal transport for prototype equipartition.
+
+    Produces a soft assignment matrix Q satisfying two constraints:
+      · Q.sum(dim=1) = 1        — each token has a valid probability distribution
+      · Q.sum(dim=0) ≈ N/K     — each prototype receives equal total mass
+
+    The second constraint is the collapse-prevention guarantee: no prototype
+    can be starved of tokens, so prototypes are forced to find K distinct
+    clusters in the embedding space.
+
+    Args:
+        scores:  (N, K) raw dot-product similarities (pre-softmax)
+        epsilon: entropy regularization strength — lower gives harder, more
+                 k-means-like assignments; 0.05 matches SwAV default
+        n_iters: Sinkhorn iterations; 3 is sufficient for convergence
+    Returns:
+        Q: (N, K) soft assignment matrix
+    """
+    N, K = scores.shape
+    # Row-wise shift for numerical stability before exponentiation
+    shifted = scores - scores.max(dim=-1, keepdim=True).values
+    Q = torch.exp(shifted / epsilon)  # (N, K)
+    Q /= Q.sum()                       # global normalization: Q.sum() = 1
+
+    for _ in range(n_iters):
+        # Prototype equipartition: column k should receive 1/K of total mass
+        Q /= Q.sum(dim=0, keepdim=True) * K
+        # Token normalization: row n should carry 1/N of total mass
+        Q /= Q.sum(dim=1, keepdim=True) * N
+
+    return Q * N  # rescale: rows now sum to 1, columns sum to N/K
 
 
 # ─── Language Prototypes ──────────────────────────────────────────────────────
@@ -176,7 +165,6 @@ class LanguagePrototypes(nn.Module):
     Responsibilities:
       · Compute pre-contextual language distributions p⁽⁰⁾_t from raw h_base.
       · Compute continuous switch magnitudes s_t.
-      · Return prototype diversity regularisation loss L_div.
 
     Temperature τ is stored as log_τ for unconstrained optimisation and
     retrieved via the .tau property as exp(log_τ), always positive.
@@ -231,20 +219,6 @@ class LanguagePrototypes(nn.Module):
         sim = (p[:, 1:] * p[:, :-1]).sum(dim=-1)              # (B, T−1)
         zeros = torch.zeros(p.size(0), 1, device=p.device, dtype=p.dtype)
         return torch.cat([zeros, 1.0 - sim], dim=1)           # (B, T)
-
-
-    def diversity_loss(self) -> torch.Tensor:
-        """
-        Exponential repulsion loss that never reaches zero.
-        Always positive, always has gradient, exponentially steeper near collapse.
-        """
-        L_n = F.normalize(self.prototypes, dim=-1)             # (K, d)
-        cos = L_n @ L_n.T                                      # (K, K)
-        mask = torch.triu(
-            torch.ones(self.K, self.K, device=cos.device), diagonal=1
-        )
-        repulsion = torch.exp(cos) - math.exp(-1.0)
-        return (repulsion * mask).sum() / (self.K * (self.K - 1) / 2.0)
 
 
 # ─── Input Embeddings ─────────────────────────────────────────────────────────
@@ -552,21 +526,15 @@ class SBERTaGenerator(nn.Module):
 
 class SBERTaModel(nn.Module):
     """
-    Bare SBERTa encoder with single-stage language distribution computation.
+    Bare SBERTa encoder — zero-knowledge, script-agnostic.
 
-    p⁽⁰⁾_t is computed from raw h_base (tok + pos) and used for:
-      · Embedding augmentation (avoids circular dependency)
-      · Attention compatibility biases C_h and γ (encoder refines through context)
-
-    The encoder's 12 layers of full self-attention resolve ambiguity through
-    contextual processing, making a separate windowed refinement step redundant.
+    p⁽⁰⁾ is computed purely from tok+pos embeddings via learned prototypes.
+    No Unicode signals, no dictionaries, no external language hints.
+    Language structure emerges solely from the MLM distributional objective
+    and is stabilised by the Sinkhorn clustering loss in the pre-training wrapper.
     """
 
-    def __init__(
-        self,
-        config: SBERTaConfig,
-        script_ids: Optional[torch.Tensor] = None,
-    ) -> None:
+    def __init__(self, config: SBERTaConfig) -> None:
         super().__init__()
         self.config: SBERTaConfig = config
         self.prototypes: LanguagePrototypes = LanguagePrototypes(config)
@@ -574,29 +542,6 @@ class SBERTaModel(nn.Module):
         self.layers: nn.ModuleList = nn.ModuleList(
             [SBERTaLayer(config) for _ in range(config.num_hidden_layers)]
         )
-        if script_ids is not None:
-            self.register_buffer("script_ids", script_ids)
-
-    def _compute_script_prior(
-        self,
-        input_ids: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        if not hasattr(self, "script_ids"):
-            return None
-
-        K = self.config.num_languages
-        B, T = input_ids.shape
-
-        token_script = self.script_ids[input_ids]
-
-        prior = torch.full((B, T, K), 1.0 / K, device=input_ids.device)
-        for k in range(K):
-            assigned = (token_script == k)
-            if assigned.any():
-                prior[assigned] = 0.0
-                prior[assigned, k] = 1.0
-
-        return prior
 
     def forward(
         self,
@@ -618,16 +563,8 @@ class SBERTaModel(nn.Module):
         h_base = self.embeddings.get_base(input_ids, stop_grad=stop_embedding_grad)  # (B, T, d)
 
         # Stage 2: pre-contextual language assignments + switch magnitudes
-        p_learned = self.prototypes.get_distributions(h_base)           # (B, T, K)
-        p_script  = self._compute_script_prior(input_ids)
-
-        if p_script is not None:
-            w = self.config.script_prior_weight
-            p0 = (1.0 - w) * p_learned + w * p_script
-        else:
-            p0 = p_learned
-
-        s = self.prototypes.get_switch_magnitudes(p0)            # (B, T)
+        p0 = self.prototypes.get_distributions(h_base)          # (B, T, K)
+        s  = self.prototypes.get_switch_magnitudes(p0)           # (B, T)
 
         # Stage 3: augmented h⁽⁰⁾ uses p⁽⁰⁾ — circular-dependency free
         H = self.embeddings.augment(h_base, p0, s)               # (B, T, d)
@@ -645,10 +582,10 @@ class SBERTaModel(nn.Module):
 
 class SBERTaForPreTraining(nn.Module):
     """
-    SBERTa with ELECTRA-style RTD pre-training.
+    SBERTa with ELECTRA-style RTD pre-training — universal, zero-knowledge.
 
     Generator (1/generator_size_divisor size):
-      Receives switch-span-masked input; proposes plausible token replacements
+      Receives geometrically-masked input; proposes plausible token replacements
       via MLM. Shares the token embedding weight with the discriminator —
       the weight is passed at forward time to avoid double module-tree
       registration while preserving the tie for state_dict and the optimiser.
@@ -658,16 +595,19 @@ class SBERTaForPreTraining(nn.Module):
       classifies every real token as real or replaced. Supervised at all T
       positions — not just the ~15% masked — giving 6-7× more gradient signal
       than vanilla MLM for the same data budget.
+
+    Loss components:
+      L_gen     : generator MLM on geometrically-masked spans
+      L_RTD     : discriminator real/replaced BCE at every real token (GDES)
+      L_smooth  : unsupervised temporal stickiness across all sequence boundaries
+      L_cluster : Sinkhorn-Knopp prototype equipartition — mathematically
+                  guarantees K distinct clusters without collapse or burn-in
     """
 
-    def __init__(
-        self,
-        config: SBERTaConfig,
-        script_ids: Optional[torch.Tensor] = None,
-    ) -> None:
+    def __init__(self, config: SBERTaConfig) -> None:
         super().__init__()
         self.config: SBERTaConfig = config
-        self.sberta: SBERTaModel = SBERTaModel(config, script_ids=script_ids)
+        self.sberta: SBERTaModel = SBERTaModel(config)
         self.generator: SBERTaGenerator = SBERTaGenerator(config)
 
         # Discriminator RTD head: binary real (0) vs replaced (1)
@@ -703,31 +643,35 @@ class SBERTaForPreTraining(nn.Module):
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
 
-        cfg = self.config
+        cfg  = self.config
         real = attention_mask.bool()                               # (B, T)
 
-        # ── Step 1: span mask from original input's language structure ────
-        # p_pre is computed on unmasked input so span boundaries reflect true
-        # language identity rather than the [MASK] token distribution.
-        # Blend with script prior to avoid masking random noise in early training.
-        h_base = self.sberta.embeddings.get_base(input_ids)
-        p_learned = self.sberta.prototypes.get_distributions(h_base)   # (B, T, K)
-        p_script  = self.sberta._compute_script_prior(input_ids)
-        
-        if p_script is not None:
-            w = cfg.script_prior_weight
-            p_pre = (1.0 - w) * p_learned + w * p_script
-        else:
-            p_pre = p_learned
-        
-        s_pre = self.sberta.prototypes.get_switch_magnitudes(p_pre)  # (B, T)
+        # ── Step 1: base embeddings + language distributions (unmasked input) ─
+        # p0 and s0 computed on original input so all losses are consistent
+        # with the true (uncorrupted) language structure of the sequence.
+        h_base = self.sberta.embeddings.get_base(input_ids)        # (B, T, d)
+        p0     = self.sberta.prototypes.get_distributions(h_base)  # (B, T, K)
+        s0     = self.sberta.prototypes.get_switch_magnitudes(p0)  # (B, T)
 
-        span_mask = _switch_span_mask(p_pre, attention_mask, cfg.mlm_probability)
+        # ── L_cluster: Sinkhorn-Knopp target on real token embeddings ─────────
+        # Scores mirror get_distributions exactly (same dot-product / tau),
+        # so the clustering loss and p0 are consistent objectives.
+        # Sinkhorn's epsilon independently controls assignment entropy.
+        real_h       = h_base[real]                                             # (N_real, d)
+        proto_scores = real_h @ self.sberta.prototypes.prototypes.T \
+                       / self.sberta.prototypes.tau                             # (N_real, K)
+        Q            = _sinkhorn(proto_scores.detach(), cfg.sinkhorn_epsilon, cfg.sinkhorn_iters)
+        loss_cluster = F.cross_entropy(proto_scores, Q)
 
+        # ── Step 2: geometric span masking (language-agnostic) ────────────────
+        span_mask = _geometric_span_mask(
+            attention_mask, cfg.mlm_probability,
+            cfg.span_mask_geo_p, cfg.span_mask_min_len, cfg.span_mask_max_len,
+        )
         masked_ids = input_ids.clone()
         masked_ids[span_mask] = cfg.mask_token_id
 
-        # ── Step 2: generator — single forward for both loss and sampling ─
+        # ── Step 3: generator — single forward for both loss and sampling ─────
         # Gradients flow through gen_logits for L_gen.
         # Sampling uses .detach() + no_grad so the corruption graph is clean.
         gen_logits = self.generator(masked_ids, self._tok_w, attention_mask)  # (B, T, V)
@@ -742,14 +686,14 @@ class SBERTaForPreTraining(nn.Module):
         corrupted_ids[span_mask] = gen_tokens
         is_replaced = (corrupted_ids != input_ids).float()         # (B, T)
 
-        # ── Step 3: discriminator forward on corrupted sequence ───────────
+        # ── Step 4: discriminator forward on corrupted sequence ───────────────
         # GDES: stop RTD gradients from flowing into the shared embedding table.
         # The discriminator's task (detect replaced tokens) should not shape the
         # embeddings that feed prototype assignment and language distributions.
         # Only the generator's MLM loss updates the shared embeddings.
-        H, p0, s = self.sberta(corrupted_ids, attention_mask, stop_embedding_grad=True)
+        H, _, _ = self.sberta(corrupted_ids, attention_mask, stop_embedding_grad=True)
 
-        # ── L_gen (generator MLM) ────────────────────────────────────────
+        # ── L_gen (generator MLM) ─────────────────────────────────────────────
         gen_labels = input_ids.new_full(input_ids.shape, -100)
         gen_labels[span_mask] = input_ids[span_mask]
         n_masked = max(int(span_mask.sum().item()), 1)
@@ -760,7 +704,7 @@ class SBERTaForPreTraining(nn.Module):
             reduction="sum",
         ) / n_masked
 
-        # ── L_RTD (discriminator) ────────────────────────────────────────
+        # ── L_RTD (discriminator) ─────────────────────────────────────────────
         rtd_logits = self.rtd_head(H).squeeze(-1)                  # (B, T)
         loss_rtd = F.binary_cross_entropy_with_logits(
             rtd_logits[real],
@@ -775,34 +719,24 @@ class SBERTaForPreTraining(nn.Module):
             rtd_preds = (rtd_logits[real] > 0.0).float()
             rtd_acc = (rtd_preds == is_replaced[real]).float().mean().item()
 
-        # ── L_smooth (unsupervised temporal stickiness) ───────────────────
-        # Mask cross-document boundaries when segment_ids is provided
+        # ── L_smooth (unsupervised temporal stickiness) ───────────────────────
+        # No cross-script exclusion: the model must discover all boundaries,
+        # including mono-script ones (Spanglish, Hinglish, Franglais, etc.).
+        # Segment boundaries from packed sequences are still respected.
         if segment_ids is not None:
             cross_doc = segment_ids[:, 1:] != segment_ids[:, :-1]    # (B, T-1)
             switch_mask = real[:, 1:] & real[:, :-1] & ~cross_doc    # (B, T-1)
         else:
             switch_mask = real[:, 1:] & real[:, :-1]                 # (B, T-1)
-        
-        # Exclude cross-script boundaries (Arabic↔Latin) from smoothing penalty
-        if hasattr(self.sberta, "script_ids"):
-            s_left  = self.sberta.script_ids[input_ids[:, :-1]]
-            s_right = self.sberta.script_ids[input_ids[:, 1: ]]
-            both_known    = (s_left >= 0) & (s_right >= 0)
-            cross_script  = both_known & (s_left != s_right)
-            switch_mask   = switch_mask & ~cross_script
-        
-        loss_smooth = s_pre[:, 1:][switch_mask].mean() if switch_mask.any() else input_ids.new_zeros(())
 
-        # ── L_div (prototype diversity) ───────────────────────────────────
-        # Kept for future K>2 experiments; disabled by lambda_div=0.0 with script prior
-        loss_div = self.sberta.prototypes.diversity_loss() if cfg.lambda_div > 0 else input_ids.new_zeros(())
+        loss_smooth = s0[:, 1:][switch_mask].mean() if switch_mask.any() else input_ids.new_zeros(())
 
-        # ── Combined loss ─────────────────────────────────────────────────
+        # ── Combined loss ─────────────────────────────────────────────────────
         loss = (
             loss_gen
-            + cfg.rtd_weight * loss_rtd
-            + cfg.lambda_smooth * loss_smooth
-            + cfg.lambda_div * loss_div
+            + cfg.rtd_weight     * loss_rtd
+            + cfg.lambda_smooth  * loss_smooth
+            + cfg.lambda_cluster * loss_cluster
         )
 
         return {
@@ -810,11 +744,11 @@ class SBERTaForPreTraining(nn.Module):
             "loss_gen":          loss_gen.item(),
             "loss_rtd":          loss_rtd.item(),
             "loss_smooth":       loss_smooth.item(),
-            "loss_div":          loss_div.item(),
+            "loss_cluster":      loss_cluster.item(),
             "rtd_acc":           rtd_acc,
             "n_masked":          n_masked,
-            "language_probs":    p_pre,    # (B, T, K) — from unmasked input, consistent with losses
-            "switch_magnitudes": s_pre,    # (B, T) — from unmasked input, consistent with losses
+            "language_probs":    p0,    # (B, T, K) — from unmasked input, consistent with losses
+            "switch_magnitudes": s0,    # (B, T) — from unmasked input, consistent with losses
         }
 
     def _init_weights(self, module: nn.Module) -> None:

@@ -25,7 +25,6 @@ class SBERTaConfig:
     num_languages: int = 2
     proto_temperature: float = 1.0
     learnable_temperature: bool = True
-    script_prior_weight: float = 0.5
 
     # ── Regularisation ────────────────────────────────────────────────────
     hidden_dropout_prob: float = 0.1
@@ -35,8 +34,18 @@ class SBERTaConfig:
     mlm_probability: float = 0.15
     rtd_weight: float = 15.0
     generator_size_divisor: int = 2
+
+    # Geometric span masking — mean span length = 1/span_mask_geo_p tokens
+    span_mask_geo_p: float = 0.2
+    span_mask_min_len: int = 1
+    span_mask_max_len: int = 10
+
+    # Sinkhorn-Knopp clustering (SwAV-style collapse prevention)
+    sinkhorn_epsilon: float = 0.05   # entropy regularization; lower → harder assignments
+    sinkhorn_iters: int = 3          # 3 iterations sufficient per SwAV paper
+
     lambda_smooth: float = 5.0
-    lambda_div: float = 0.0  # Kept for future K>2 experiments; disabled with script prior
+    lambda_cluster: float = 1.0      # weight for Sinkhorn clustering loss
 
     # ────────────────────────────────────────────────────────────────────
     def __post_init__(self) -> None:

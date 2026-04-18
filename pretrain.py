@@ -26,20 +26,20 @@ in the dataset or pass any external switch labels — the model discovers
 language boundaries autonomously via the unsupervised L_smooth loss.
 
 Combined loss:
-    L = L_gen  +  w_rtd · L_RTD  +  λ_smooth · L_smooth  +  λ_div · L_div
+    L = L_gen  +  w_rtd · L_RTD  +  λ_smooth · L_smooth  +  λ_cluster · L_cluster
 
-    L_gen        : generator MLM on switch-span-masked positions
+    L_gen        : generator MLM on geometrically-masked spans
     L_RTD        : discriminator real/replaced BCE at every real token
                    (6–7× more gradient signal than vanilla MLM)
     L_smooth     : unsupervised temporal stickiness — mean switch magnitude
-                   penalised at within-script boundaries (cross-script transitions
-                   excluded via Unicode script prior); no curriculum needed
-    L_div        : prototype diversity — disabled (lambda_div=0.0) with script prior;
-                   kept for future K>2 experiments
+                   penalised at all within-sequence boundaries
+    L_cluster    : Sinkhorn-Knopp prototype equipartition — mathematically
+                   guarantees K distinct clusters without collapse or burn-in
 
-The Unicode script prior (script_prior_weight=0.5) provides strong separation
-from step 1, eliminating the need for burn-in curricula, balance losses, or
-EMA-tracked usage statistics.
+The model is fully zero-knowledge: no Unicode priors, no script IDs, no
+dictionaries. Language structure emerges purely from the MLM distributional
+objective, stabilised by the Sinkhorn clustering loss. Works on any
+K-language mixture (Darija, Spanglish, Hinglish, Franglais, etc.).
 
 Checkpointing
 -------------
@@ -505,14 +505,23 @@ def train(
         config.num_languages,
     )
     log.info(
-        "Loss weights: w_rtd=%.1f  λ_smooth=%.3f  λ_div=%.3f",
+        "Loss weights: w_rtd=%.1f  λ_smooth=%.3f  λ_cluster=%.3f",
         config.rtd_weight,
         config.lambda_smooth,
-        config.lambda_div,
+        config.lambda_cluster,
     )
     log.info(
-        "Script prior: weight=%.2f (blends learned prototypes with Unicode script signal)",
-        config.script_prior_weight,
+        "Span masking: geo_p=%.2f  min=%d  max=%d  (mean span %.1f tokens)",
+        config.span_mask_geo_p,
+        config.span_mask_min_len,
+        config.span_mask_max_len,
+        1.0 / config.span_mask_geo_p,
+    )
+    log.info(
+        "Sinkhorn: epsilon=%.3f  iters=%d  lambda_cluster=%.2f",
+        config.sinkhorn_epsilon,
+        config.sinkhorn_iters,
+        config.lambda_cluster,
     )
 
     # ── Tokenizer ─────────────────────────────────────────────────────────
@@ -571,19 +580,7 @@ def train(
     )
 
     # ── Model ─────────────────────────────────────────────────────────────
-    from sberta.model import _build_script_ids
-    vocab_pieces = [tokenizer.id_to_piece(i) for i in range(tokenizer.vocab_size)]
-    script_ids   = _build_script_ids(tokenizer.vocab_size, vocab_pieces)
-    log.info(
-        "Script IDs: %s",
-        {
-            sid: sum(1 for x in script_ids if x == sid).item()
-            for sid in script_ids.unique().tolist()
-            if sid >= 0
-        },
-    )
-
-    model = SBERTaForPreTraining(config, script_ids=script_ids).to(device)
+    model = SBERTaForPreTraining(config).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log.info("Trainable parameters: %.1f M", n_params / 1e6)
 
@@ -642,7 +639,7 @@ def train(
     optimizer.zero_grad()
 
     # Loss accumulators — reset every log_every optimizer steps.
-    LOSS_KEYS = ("loss", "loss_gen", "loss_rtd", "loss_smooth", "loss_div")
+    LOSS_KEYS = ("loss", "loss_gen", "loss_rtd", "loss_smooth", "loss_cluster")
     acc: Dict[str, float] = {k: 0.0 for k in LOSS_KEYS}
     rtd_acc_sum: float = 0.0
     n_masked_acc: int = 0
@@ -818,7 +815,7 @@ def train(
 
             log.info(
                 "step %7d/%d  loss %.4f "
-                "[gen=%.4f rtd=%.4f(acc=%.1f%%) smooth=%.4f div=%.4f]"
+                "[gen=%.4f rtd=%.4f(acc=%.1f%%) smooth=%.4f cluster=%.4f]"
                 "  ppl %.1f  τ %.3f  masked/step %.0f"
                 "  lr %.2e  ‖g‖ %.3f%s"
                 "  %.1f stp/s  %.0f tok/s",
@@ -826,7 +823,7 @@ def train(
                 avg["loss"],
                 avg["loss_gen"],
                 avg["loss_rtd"], rtd_acc_sum / log_every * 100.0,
-                avg["loss_smooth"], avg["loss_div"],
+                avg["loss_smooth"], avg["loss_cluster"],
                 ppl, tau_val,
                 n_masked_acc / log_every,
                 lr_now, grad_norm, mem_str,
@@ -838,16 +835,16 @@ def train(
 
             # Snapshot for checkpoint metadata
             last_metrics = {
-                "step":             global_step,
-                "loss":             avg["loss"],
-                "loss_gen":         avg["loss_gen"],
-                "loss_rtd":         avg["loss_rtd"],
-                "rtd_acc":          rtd_acc_sum / log_every,
-                "loss_smooth":      avg["loss_smooth"],
-                "loss_div":         avg["loss_div"],
-                "ppl":              ppl,
-                "tau":              tau_val,
-                "lr":               lr_now,
+                "step":              global_step,
+                "loss":              avg["loss"],
+                "loss_gen":          avg["loss_gen"],
+                "loss_rtd":          avg["loss_rtd"],
+                "rtd_acc":           rtd_acc_sum / log_every,
+                "loss_smooth":       avg["loss_smooth"],
+                "loss_cluster":      avg["loss_cluster"],
+                "ppl":               ppl,
+                "tau":               tau_val,
+                "lr":                lr_now,
                 "proto_entropy_pct": entropy_pct,
             }
 
