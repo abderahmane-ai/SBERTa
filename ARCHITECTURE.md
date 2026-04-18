@@ -161,6 +161,12 @@ SBERTa uses post-LayerNorm (LayerNorm after residual) for stability during ELECT
 - Full architecture ($d$, $H$, $L$)
 - Binary classification head: $\mathbb{R}^d \to \mathbb{R}$
 
+**Gradient-Disentangled Embedding Sharing (GDES):**
+
+The generator and discriminator share the token embedding table, but gradients from the discriminator's RTD loss do not flow into it. Only the generator's MLM loss updates the shared embeddings. This prevents a gradient tug-of-war: the generator learns embeddings that help predict masked tokens from context, while the discriminator learns to detect replaced tokens without distorting the embeddings that feed prototype assignment and language distributions.
+
+Implementation: the discriminator's token embedding lookup is detached (`stop_embedding_grad=True`). All other discriminator parameters — prototypes, position embeddings, language embeddings, encoder layers, RTD head — receive gradients from the RTD loss as usual.
+
 ### 6.2 Switch-Span Masking
 
 Instead of random token masking, SBERTa masks entire language-homogeneous spans. Span boundaries are derived from the blended $p^{(0)}_t$, so that script identity informs masking decisions from step one:

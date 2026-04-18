@@ -277,22 +277,23 @@ class SBERTaEmbeddings(nn.Module):
         self.layer_norm: nn.LayerNorm = nn.LayerNorm(d, eps=config.layer_norm_eps)
         self.dropout: nn.Dropout = nn.Dropout(config.hidden_dropout_prob)
 
-    def get_base(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def get_base(self, input_ids: torch.Tensor, stop_grad: bool = False) -> torch.Tensor:
         """
         Stage 1: tok + pos embeddings without normalisation or augmentation.
         Used to compute p⁽⁰⁾ and s before augmentation.
 
         Args:
             input_ids: (B, T)
+            stop_grad: If True, detach token embeddings (GDES for discriminator)
         Returns:
             h_base: (B, T, d)
         """
         T: int = input_ids.size(1)
         positions = torch.arange(T, device=input_ids.device).unsqueeze(0)
-        return (
-            self.token_embeddings(input_ids)
-            + self.position_embeddings(positions)
-        )
+        tok_emb = self.token_embeddings(input_ids)
+        if stop_grad:
+            tok_emb = tok_emb.detach()
+        return tok_emb + self.position_embeddings(positions)
 
     def augment(
         self,
@@ -601,18 +602,20 @@ class SBERTaModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        stop_embedding_grad: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
-            input_ids:      (B, T)
-            attention_mask: (B, T) binary — 1 for real tokens, 0 for padding
+            input_ids:           (B, T)
+            attention_mask:      (B, T) binary — 1 for real tokens, 0 for padding
+            stop_embedding_grad: If True, detach token embeddings (GDES)
         Returns:
             H:  (B, T, d) — final encoder hidden states
             p0: (B, T, K) — pre-contextual language distributions
             s:  (B, T)    — switch magnitudes
         """
         # Stage 1: tok + pos (no LN, no language augmentation yet)
-        h_base = self.embeddings.get_base(input_ids)             # (B, T, d)
+        h_base = self.embeddings.get_base(input_ids, stop_grad=stop_embedding_grad)  # (B, T, d)
 
         # Stage 2: pre-contextual language assignments + switch magnitudes
         p_learned = self.prototypes.get_distributions(h_base)           # (B, T, K)
@@ -740,7 +743,11 @@ class SBERTaForPreTraining(nn.Module):
         is_replaced = (corrupted_ids != input_ids).float()         # (B, T)
 
         # ── Step 3: discriminator forward on corrupted sequence ───────────
-        H, p0, s = self.sberta(corrupted_ids, attention_mask)
+        # GDES: stop RTD gradients from flowing into the shared embedding table.
+        # The discriminator's task (detect replaced tokens) should not shape the
+        # embeddings that feed prototype assignment and language distributions.
+        # Only the generator's MLM loss updates the shared embeddings.
+        H, p0, s = self.sberta(corrupted_ids, attention_mask, stop_embedding_grad=True)
 
         # ── L_gen (generator MLM) ────────────────────────────────────────
         gen_labels = input_ids.new_full(input_ids.shape, -100)
