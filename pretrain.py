@@ -491,8 +491,7 @@ def train(
         config.smooth_weight_min,
     )
     log.info(
-        "Loss params: div_margin=%.3f  balance_factor=%.3f",
-        config.div_margin,
+        "Loss params: balance_factor=%.3f",
         config.balance_min_usage_factor,
     )
 
