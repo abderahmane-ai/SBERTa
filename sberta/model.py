@@ -736,8 +736,8 @@ class SBERTaForPreTraining(nn.Module):
             "loss_balance":      loss_balance.item(),
             "rtd_acc":           rtd_acc,
             "n_masked":          n_masked,
-            "language_probs":    p0,       # (B, T, K) — pre-contextual, for monitoring
-            "switch_magnitudes": s,        # (B, T) — from corrupted input, for analysis
+            "language_probs": p_pre,    # (B, T, K) — from unmasked input, consistent with losses
+            "switch_magnitudes": s_pre,        # (B, T) — from unmasked input, consistent with losses
         }
 
     def _init_weights(self, module: nn.Module) -> None:
