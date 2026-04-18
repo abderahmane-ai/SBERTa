@@ -22,7 +22,7 @@ class SBERTaConfig:
     layer_norm_eps: float = 1e-12
 
     # ── Code-switching ────────────────────────────────────────────────────
-    num_languages: int = 4
+    num_languages: int = 3
     proto_temperature: float = 0.5
     learnable_temperature: bool = False
 
@@ -32,14 +32,14 @@ class SBERTaConfig:
 
     # ── Pre-training (ELECTRA-style RTD) ──────────────────────────────────
     mlm_probability: float = 0.15
-    rtd_weight: float = 50.0
-    generator_size_divisor: int = 2
+    rtd_weight: float = 30.0
+    generator_size_divisor: int = 3
     lambda_smooth: float = 5.0
     smooth_warmup_ratio: float = 0.15
     smooth_weight_min: float = 0.05
     burnin_ratio: float = 0.05
     lambda_div: float = 5.0
-    lambda_balance: float = 30.0
+    lambda_balance: float = 5.0
     balance_min_usage_factor: float = 0.5
 
     # ────────────────────────────────────────────────────────────────────

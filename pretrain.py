@@ -569,7 +569,7 @@ def train(
         1.0 / config.num_languages,
         device=device,
     )
-    EMA_DECAY: float = 0.999
+    EMA_DECAY: float = 0.995
 
     # ── Mixed precision ────────────────────────────────────────────────────
     use_amp = device.type == "cuda"

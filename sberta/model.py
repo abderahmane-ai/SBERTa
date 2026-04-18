@@ -101,15 +101,21 @@ def _switch_span_mask(
         starts = is_start.nonzero(as_tuple=True)[0]  # (n_spans,)
         ends = torch.cat([starts[1:], starts.new_tensor([real_len])])
 
-        target_n = max(1, int(real_len * target_mask_prob))
+        target_n  = max(1, int(real_len * target_mask_prob))
+        # Hard cap at 30% to prevent a single dominant-language span from
+        # covering the entire sequence when prototypes collapse.
+        max_mask_n = int(real_len * min(target_mask_prob * 2.0, 0.30))
         starts_list = starts.tolist()
         ends_list = ends.tolist()
 
         n_masked = 0
         for idx in torch.randperm(len(starts_list), device=p.device).tolist():
-            if n_masked >= target_n:
+            if n_masked >= target_n or n_masked >= max_mask_n:
                 break
             s, e = starts_list[idx], ends_list[idx]
+            # Skip spans that would overshoot the hard cap by more than one span
+            if n_masked + (e - s) > max_mask_n:
+                continue
             span_mask[b, s:e] = True
             n_masked += e - s
 

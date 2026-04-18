@@ -27,6 +27,8 @@ __all__ = [
     "SBERTaLayer",
     "SBERTaModel",
     "SBERTaForPreTraining",
+    # Classification
+    "SBERTaForSequenceClassification",
     # Tokenizer
     "SBERTaTokenizer",
 ]
