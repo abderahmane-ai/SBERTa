@@ -26,16 +26,20 @@ in the dataset or pass any external switch labels — the model discovers
 language boundaries autonomously via the unsupervised L_smooth loss.
 
 Combined loss:
-    L = L_gen  +  w_rtd · L_RTD  +  λ_smooth · w_curr · L_smooth  +  λ_div · L_div  +  λ_balance · L_balance
+    L = L_gen  +  w_rtd · L_RTD  +  λ_smooth · L_smooth  +  λ_div · L_div
 
     L_gen        : generator MLM on switch-span-masked positions
     L_RTD        : discriminator real/replaced BCE at every real token
                    (6–7× more gradient signal than vanilla MLM)
     L_smooth     : unsupervised temporal stickiness — mean switch magnitude
-                   penalised with a two-phase curriculum (burn-in → ramp);
-                   no external labels required
-    L_div        : prototype diversity — prevents prototype collapse
-    L_balance    : soft minimum-usage — rescues dying prototypes below factor/K threshold
+                   penalised at within-script boundaries (cross-script transitions
+                   excluded via Unicode script prior); no curriculum needed
+    L_div        : prototype diversity — disabled (lambda_div=0.0) with script prior;
+                   kept for future K>2 experiments
+
+The Unicode script prior (script_prior_weight=0.5) provides strong separation
+from step 1, eliminating the need for burn-in curricula, balance losses, or
+EMA-tracked usage statistics.
 
 Checkpointing
 -------------
@@ -108,22 +112,40 @@ class StreamingTextDataset(IterableDataset):
         self.shuffle_files = shuffle_files
 
     def _iter_file(self, path: Path) -> Iterator[dict]:
+        buffer_ids: List[int] = []
+        buffer_segs: List[int] = []
+        seg_id = 0
+
         with open(path, encoding="utf-8", errors="replace") as f_text:
             for raw in f_text:
-                ids_content: List[int] = self.tokenizer.encode(
+                sent_ids = self.tokenizer.encode(
                     raw.strip(),
-                    add_sep=False,
-                    max_length=self.max_length - 1,   # reserve one slot for SEP
+                    add_sep=True,
+                    max_length=self.max_length,
                 )
-                if not ids_content:
+                if not sent_ids:
                     continue
 
-                ids: List[int] = ids_content + [self.tokenizer.SEP_ID]
-                T = len(ids)
-                yield {
-                    "input_ids":      torch.tensor(ids, dtype=torch.long),
-                    "attention_mask": torch.ones(T, dtype=torch.long),
-                }
+                if len(buffer_ids) + len(sent_ids) > self.max_length:
+                    T = len(buffer_ids)
+                    yield {
+                        "input_ids":      torch.tensor(buffer_ids,  dtype=torch.long),
+                        "attention_mask": torch.ones(T,              dtype=torch.long),
+                        "segment_ids":    torch.tensor(buffer_segs, dtype=torch.long),
+                    }
+                    buffer_ids, buffer_segs = [], []
+                    seg_id += 1
+
+                buffer_ids.extend(sent_ids)
+                buffer_segs.extend([seg_id] * len(sent_ids))
+
+        if buffer_ids:
+            T = len(buffer_ids)
+            yield {
+                "input_ids":      torch.tensor(buffer_ids,  dtype=torch.long),
+                "attention_mask": torch.ones(T,              dtype=torch.long),
+                "segment_ids":    torch.tensor(buffer_segs, dtype=torch.long),
+            }
 
     def _get_worker_paths(self) -> List[Path]:
         """
@@ -209,13 +231,20 @@ def collate_fn(batch: List[dict], pad_id: int) -> dict:
 
     input_ids      = torch.full((B, T), pad_id, dtype=torch.long)
     attention_mask = torch.zeros(B, T, dtype=torch.long)
+    segment_ids    = torch.zeros(B, T, dtype=torch.long)
 
     for i, item in enumerate(batch):
         n = item["input_ids"].size(0)
         input_ids[i, :n]      = item["input_ids"]
         attention_mask[i, :n] = item["attention_mask"]
+        if "segment_ids" in item:
+            segment_ids[i, :n] = item["segment_ids"]
 
-    return {"input_ids": input_ids, "attention_mask": attention_mask}
+    return {
+        "input_ids":      input_ids,
+        "attention_mask": attention_mask,
+        "segment_ids":    segment_ids,
+    }
 
 
 # ─── Scheduler ────────────────────────────────────────────────────────────────
@@ -340,7 +369,6 @@ def save_checkpoint(
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     config,
     metrics: dict,
-    ema_usage: Optional[torch.Tensor] = None,
 ) -> Path:
     """
     Save a full training checkpoint and update the `latest` pointer file.
@@ -359,8 +387,6 @@ def save_checkpoint(
     (ckpt_dir / "metrics.json").write_text(
         json.dumps(metrics, indent=2), encoding="utf-8"
     )
-    if ema_usage is not None:
-        torch.save(ema_usage.cpu(), ckpt_dir / "ema_usage.pt")
     (run_dir / "latest").write_text(str(ckpt_dir), encoding="utf-8")
 
     log.info("Checkpoint saved → %s", ckpt_dir)
@@ -479,25 +505,14 @@ def train(
         config.num_languages,
     )
     log.info(
-        "Loss weights: w_rtd=%.1f  λ_smooth=%.3f  λ_div=%.3f  λ_balance=%.3f",
+        "Loss weights: w_rtd=%.1f  λ_smooth=%.3f  λ_div=%.3f",
         config.rtd_weight,
         config.lambda_smooth,
         config.lambda_div,
-        config.lambda_balance,
-    )
-    burnin_steps_abs = int(config.burnin_ratio * total_steps)
-    warmup_steps_abs = int(config.smooth_warmup_ratio * total_steps)
-    log.info(
-        "Schedule: burnin=%.1f%% (%d steps)  smooth_warmup=%.1f%% (%d steps)  smooth_w_min=%.3f",
-        config.burnin_ratio * 100,
-        burnin_steps_abs,
-        config.smooth_warmup_ratio * 100,
-        warmup_steps_abs,
-        config.smooth_weight_min,
     )
     log.info(
-        "Loss params: balance_factor=%.3f",
-        config.balance_min_usage_factor,
+        "Script prior: weight=%.2f (blends learned prototypes with Unicode script signal)",
+        config.script_prior_weight,
     )
 
     # ── Tokenizer ─────────────────────────────────────────────────────────
@@ -556,20 +571,21 @@ def train(
     )
 
     # ── Model ─────────────────────────────────────────────────────────────
-    model = SBERTaForPreTraining(config).to(device)
+    from sberta.model import _build_script_ids
+    vocab_pieces = [tokenizer.id_to_piece(i) for i in range(tokenizer.vocab_size)]
+    script_ids   = _build_script_ids(tokenizer.vocab_size, vocab_pieces)
+    log.info(
+        "Script IDs: %s",
+        {
+            sid: sum(1 for x in script_ids if x == sid).item()
+            for sid in script_ids.unique().tolist()
+            if sid >= 0
+        },
+    )
+
+    model = SBERTaForPreTraining(config, script_ids=script_ids).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log.info("Trainable parameters: %.1f M", n_params / 1e6)
-
-    # ── EMA-tracked prototype usage ───────────────────────────────────────
-    # Exponential moving average of per-prototype usage — robust to batch variance.
-    # Decay=0.999 means the EMA has an effective window of ~1000 steps,
-    # reflecting global distribution rather than per-batch noise.
-    ema_usage: torch.Tensor = torch.full(
-        (config.num_languages,),
-        1.0 / config.num_languages,
-        device=device,
-    )
-    EMA_DECAY: float = 0.995
 
     # ── Mixed precision ────────────────────────────────────────────────────
     use_amp = device.type == "cuda"
@@ -621,25 +637,15 @@ def train(
         run_dir, model, optimizer, scheduler, device
     )
 
-    # Restore EMA usage if resuming from checkpoint
-    if ckpt_dir is not None:
-        ema_ckpt = ckpt_dir / "ema_usage.pt"
-        if ema_ckpt.exists():
-            ema_usage = torch.load(ema_ckpt, map_location=device, weights_only=True)
-            log.info("EMA usage restored: %s", "  ".join(
-                f"p{i}={ema_usage[i].item()*100:.1f}%" for i in range(config.num_languages)
-            ))
-
     # ── Training state ────────────────────────────────────────────────────
     model.train()
     optimizer.zero_grad()
 
     # Loss accumulators — reset every log_every optimizer steps.
-    LOSS_KEYS = ("loss", "loss_gen", "loss_rtd", "loss_smooth", "loss_div", "loss_sharp", "loss_balance")
+    LOSS_KEYS = ("loss", "loss_gen", "loss_rtd", "loss_smooth", "loss_div")
     acc: Dict[str, float] = {k: 0.0 for k in LOSS_KEYS}
-    rtd_acc_acc: float = 0.0  # RTD accuracy accumulator (separate — not a loss)
+    rtd_acc_sum: float = 0.0
     n_masked_acc: int = 0
-    smooth_weight_acc: float = 0.0
 
     # Prototype usage (token-level dominant prototype counts)
     proto_counts = torch.zeros(config.num_languages, device=device)
@@ -680,14 +686,13 @@ def train(
 
             input_ids      = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+            segment_ids    = batch["segment_ids"].to(device, non_blocking=True) if "segment_ids" in batch else None
 
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 out = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    global_step=global_step,
-                    total_steps=total_steps,
-                    usage_ema=ema_usage.detach(),
+                    segment_ids=segment_ids,
                 )
                 loss_scaled = out["loss"] / grad_accum
 
@@ -697,18 +702,13 @@ def train(
             for k in LOSS_KEYS[1:]:
                 step_acc[k] += out[k] / grad_accum
             step_n_masked += out["n_masked"]
-            smooth_weight_acc += out["smooth_weight"] / grad_accum
-            rtd_acc_acc += out["rtd_acc"] / grad_accum
+            rtd_acc_sum += out["rtd_acc"] / grad_accum
 
             # Prototype usage and switch stats (no grad needed)
             with torch.no_grad():
                 real_mask = attention_mask.bool()
 
-                # Update EMA using soft mean usage from this batch
-                batch_usage = out["language_probs"][real_mask].mean(dim=0)  # (K,) soft
-                ema_usage = EMA_DECAY * ema_usage + (1.0 - EMA_DECAY) * batch_usage
-
-                # Dominant prototype per real token — from context-refined p_ctx
+                # Dominant prototype per real token
                 dominant = out["language_probs"].argmax(-1)[real_mask]  # (N_real,)
                 proto_counts += torch.bincount(
                     dominant, minlength=config.num_languages
@@ -818,25 +818,21 @@ def train(
 
             log.info(
                 "step %7d/%d  loss %.4f "
-                "[gen=%.4f rtd=%.4f(acc=%.1f%%) smooth=%.4f(w=%.2f) div=%.4f sharp=%.4f bal=%.4f]"
+                "[gen=%.4f rtd=%.4f(acc=%.1f%%) smooth=%.4f div=%.4f]"
                 "  ppl %.1f  τ %.3f  masked/step %.0f"
                 "  lr %.2e  ‖g‖ %.3f%s"
                 "  %.1f stp/s  %.0f tok/s",
                 global_step, total_steps,
                 avg["loss"],
                 avg["loss_gen"],
-                avg["loss_rtd"], rtd_acc_acc / log_every * 100.0,
-                avg["loss_smooth"], smooth_weight_acc / log_every,
-                avg["loss_div"], avg["loss_sharp"], avg["loss_balance"],
+                avg["loss_rtd"], rtd_acc_sum / log_every * 100.0,
+                avg["loss_smooth"], avg["loss_div"],
                 ppl, tau_val,
                 n_masked_acc / log_every,
                 lr_now, grad_norm, mem_str,
                 steps_per_sec, tok_per_sec,
             )
             log.info("  prototypes : %s  entropy=%.1f%%", proto_str, entropy_pct)
-            log.info("  ema_usage  : %s", "  ".join(
-                f"p{i}={ema_usage[i].item()*100:.1f}%" for i in range(config.num_languages)
-            ))
             log.info("  cosines    : %s", cos_str)
             log.info("  switch mag : mean=%s  max=%s", sw_mean_str, sw_max_str)
 
@@ -846,12 +842,9 @@ def train(
                 "loss":             avg["loss"],
                 "loss_gen":         avg["loss_gen"],
                 "loss_rtd":         avg["loss_rtd"],
-                "rtd_acc":          rtd_acc_acc / log_every,
+                "rtd_acc":          rtd_acc_sum / log_every,
                 "loss_smooth":      avg["loss_smooth"],
-                "smooth_weight":    smooth_weight_acc / log_every,
                 "loss_div":         avg["loss_div"],
-                "loss_sharp":       avg["loss_sharp"],
-                "loss_balance":     avg["loss_balance"],
                 "ppl":              ppl,
                 "tau":              tau_val,
                 "lr":               lr_now,
@@ -860,8 +853,7 @@ def train(
 
             acc          = {k: 0.0 for k in LOSS_KEYS}
             n_masked_acc = 0
-            smooth_weight_acc = 0.0
-            rtd_acc_acc  = 0.0
+            rtd_acc_sum  = 0.0
             proto_counts.zero_()
             total_tokens = 0
             sw_sum = sw_max = 0.0
@@ -874,7 +866,6 @@ def train(
                 run_dir, global_step,
                 model, optimizer, scheduler,
                 config, last_metrics,
-                ema_usage=ema_usage,
             )
 
     log.info("Training complete at step %d.", global_step)

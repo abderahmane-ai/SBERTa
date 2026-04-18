@@ -22,9 +22,10 @@ class SBERTaConfig:
     layer_norm_eps: float = 1e-12
 
     # ── Code-switching ────────────────────────────────────────────────────
-    num_languages: int = 3
-    proto_temperature: float = 0.5
-    learnable_temperature: bool = False
+    num_languages: int = 2
+    proto_temperature: float = 1.0
+    learnable_temperature: bool = True
+    script_prior_weight: float = 0.5
 
     # ── Regularisation ────────────────────────────────────────────────────
     hidden_dropout_prob: float = 0.1
@@ -32,15 +33,10 @@ class SBERTaConfig:
 
     # ── Pre-training (ELECTRA-style RTD) ──────────────────────────────────
     mlm_probability: float = 0.15
-    rtd_weight: float = 30.0
-    generator_size_divisor: int = 3
+    rtd_weight: float = 15.0
+    generator_size_divisor: int = 2
     lambda_smooth: float = 5.0
-    smooth_warmup_ratio: float = 0.15
-    smooth_weight_min: float = 0.05
-    burnin_ratio: float = 0.05
-    lambda_div: float = 5.0
-    lambda_balance: float = 5.0
-    balance_min_usage_factor: float = 0.5
+    lambda_div: float = 0.0  # Kept for future K>2 experiments; disabled with script prior
 
     # ────────────────────────────────────────────────────────────────────
     def __post_init__(self) -> None:

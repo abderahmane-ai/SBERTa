@@ -19,14 +19,19 @@ Pre-training objectives (ELECTRA-style RTD):
   Discriminator: full SBERTa — RTD binary classification at every token position,
                  giving 6-7× more gradient signal than vanilla 15%-masked MLM.
 
-  L = L_gen + w_rtd · L_RTD + λ_smooth · w_curr · L_smooth + λ_div · L_div + λ_balance · L_balance
+  L = L_gen + w_rtd · L_RTD + λ_smooth · L_smooth + λ_div · L_div
 
   L_gen        : generator MLM (span-masked positions only; normalised by n_masked)
   L_RTD        : replaced token detection — supervises every real token position
   L_smooth     : unsupervised temporal stickiness — mean switch magnitude penalised
-                 with a two-phase curriculum (burn-in → ramp); no external labels required
-  L_div        : prototype diversity — prevents prototype collapse
-  L_balance    : soft minimum-usage — rescues dying prototypes below factor/K threshold
+                 at within-script boundaries (cross-script transitions excluded via
+                 Unicode script prior); no curriculum needed
+  L_div        : prototype diversity — disabled (lambda_div=0.0) with script prior;
+                 kept for future K>2 experiments
+
+The Unicode script prior (script_prior_weight=0.5) blends learned prototype
+distributions with hard Unicode script signals, providing strong separation from
+step 1 and eliminating the need for burn-in curricula or balance losses.
 """
 
 from __future__ import annotations
@@ -39,6 +44,45 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import SBERTaConfig
+import unicodedata as _unicodedata
+
+def _build_script_ids(
+    vocab_size: int,
+    pieces: list[str],
+) -> torch.Tensor:
+    from collections import Counter
+
+    def _first_script(piece: str) -> Optional[str]:
+        for ch in piece.lstrip("\u2581"):
+            try:
+                name = _unicodedata.name(ch)
+            except ValueError:
+                continue
+            script = name.split()[0]
+            if script in ("DIGIT", "SPACE", "NO-BREAK", "ZERO", "BYTE"):
+                continue
+            return script
+        return None
+
+    script_counts: Counter = Counter()
+    token_scripts: list[Optional[str]] = []
+    for piece in pieces:
+        s = _first_script(piece)
+        token_scripts.append(s)
+        if s is not None:
+            script_counts[s] += 1
+
+    script_to_id: dict[str, int] = {
+        s: i for i, (s, _) in enumerate(script_counts.most_common())
+    }
+
+    script_ids = torch.full((vocab_size,), -1, dtype=torch.long)
+    for token_id, s in enumerate(token_scripts):
+        if s is not None and s in script_to_id:
+            script_ids[token_id] = script_to_id[s]
+
+    return script_ids
+
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -284,8 +328,8 @@ class SBERTaAttention(nn.Module):
     pᵢᵀ Cₕ pⱼ  — Cₕ ∈ ℝ^{K×K} per head, replacing the previous scalar β_h.
                    Initialised to identity (matching original β_h behaviour).
                    Learns asymmetric language affinities: Arabic↔Arabizi high,
-                   French↔Arabic medium, etc. Adds only K²×H parameters (192
-                   for base config) at negligible cost.
+                   French↔Arabic medium, etc. Adds only K²×H parameters (48
+                   for base config with K=2, H=12) at negligible cost.
     γ · sⱼ      — global switch-position bias toward language boundary tokens.
 
     Both Cₕ (as identity) and γ (as zero) are initialised so that training
@@ -517,7 +561,11 @@ class SBERTaModel(nn.Module):
     contextual processing, making a separate windowed refinement step redundant.
     """
 
-    def __init__(self, config: SBERTaConfig) -> None:
+    def __init__(
+        self,
+        config: SBERTaConfig,
+        script_ids: Optional[torch.Tensor] = None,
+    ) -> None:
         super().__init__()
         self.config: SBERTaConfig = config
         self.prototypes: LanguagePrototypes = LanguagePrototypes(config)
@@ -525,6 +573,29 @@ class SBERTaModel(nn.Module):
         self.layers: nn.ModuleList = nn.ModuleList(
             [SBERTaLayer(config) for _ in range(config.num_hidden_layers)]
         )
+        if script_ids is not None:
+            self.register_buffer("script_ids", script_ids)
+
+    def _compute_script_prior(
+        self,
+        input_ids: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        if not hasattr(self, "script_ids"):
+            return None
+
+        K = self.config.num_languages
+        B, T = input_ids.shape
+
+        token_script = self.script_ids[input_ids]
+
+        prior = torch.full((B, T, K), 1.0 / K, device=input_ids.device)
+        for k in range(K):
+            assigned = (token_script == k)
+            if assigned.any():
+                prior[assigned] = 0.0
+                prior[assigned, k] = 1.0
+
+        return prior
 
     def forward(
         self,
@@ -544,7 +615,15 @@ class SBERTaModel(nn.Module):
         h_base = self.embeddings.get_base(input_ids)             # (B, T, d)
 
         # Stage 2: pre-contextual language assignments + switch magnitudes
-        p0 = self.prototypes.get_distributions(h_base)           # (B, T, K)
+        p_learned = self.prototypes.get_distributions(h_base)           # (B, T, K)
+        p_script  = self._compute_script_prior(input_ids)
+
+        if p_script is not None:
+            w = self.config.script_prior_weight
+            p0 = (1.0 - w) * p_learned + w * p_script
+        else:
+            p0 = p_learned
+
         s = self.prototypes.get_switch_magnitudes(p0)            # (B, T)
 
         # Stage 3: augmented h⁽⁰⁾ uses p⁽⁰⁾ — circular-dependency free
@@ -578,10 +657,14 @@ class SBERTaForPreTraining(nn.Module):
       than vanilla MLM for the same data budget.
     """
 
-    def __init__(self, config: SBERTaConfig) -> None:
+    def __init__(
+        self,
+        config: SBERTaConfig,
+        script_ids: Optional[torch.Tensor] = None,
+    ) -> None:
         super().__init__()
         self.config: SBERTaConfig = config
-        self.sberta: SBERTaModel = SBERTaModel(config)
+        self.sberta: SBERTaModel = SBERTaModel(config, script_ids=script_ids)
         self.generator: SBERTaGenerator = SBERTaGenerator(config)
 
         # Discriminator RTD head: binary real (0) vs replaced (1)
@@ -603,9 +686,6 @@ class SBERTaForPreTraining(nn.Module):
         input_ids: torch.Tensor,                         # (B, T)
         attention_mask: Optional[torch.Tensor] = None,   # (B, T) binary
         segment_ids: Optional[torch.Tensor] = None,      # (B, T) document boundaries
-        global_step: int = 0,                            # current training step (curriculum)
-        total_steps: int = 0,                            # total training steps (for ratio-based curriculum)
-        usage_ema: Optional[torch.Tensor] = None,        # (K,) EMA-tracked global prototype usage
     ) -> dict:
         """
         Args:
@@ -614,12 +694,6 @@ class SBERTaForPreTraining(nn.Module):
             segment_ids:    (B, T) — document segment IDs for packed sequences.
                             Used to mask cross-document boundaries in L_smooth.
                             If None, assumes single document per sequence.
-            global_step:    current optimiser step; used for curriculum schedule.
-            total_steps:    total training steps; used to compute absolute burn-in
-                            and warmup durations from config ratios. If 0, burn-in
-                            and warmup are disabled (for fine-tuning/inference).
-            usage_ema:      (K,) EMA-tracked global prototype usage from trainer.
-                            If provided, balance loss uses this instead of batch stats.
         Returns:
             dict with 'loss' (scalar) and per-component .item() loss values.
         """
@@ -632,8 +706,17 @@ class SBERTaForPreTraining(nn.Module):
         # ── Step 1: span mask from original input's language structure ────
         # p_pre is computed on unmasked input so span boundaries reflect true
         # language identity rather than the [MASK] token distribution.
+        # Blend with script prior to avoid masking random noise in early training.
         h_base = self.sberta.embeddings.get_base(input_ids)
-        p_pre = self.sberta.prototypes.get_distributions(h_base)   # (B, T, K)
+        p_learned = self.sberta.prototypes.get_distributions(h_base)   # (B, T, K)
+        p_script  = self.sberta._compute_script_prior(input_ids)
+        
+        if p_script is not None:
+            w = cfg.script_prior_weight
+            p_pre = (1.0 - w) * p_learned + w * p_script
+        else:
+            p_pre = p_learned
+        
         s_pre = self.sberta.prototypes.get_switch_magnitudes(p_pre)  # (B, T)
 
         span_mask = _switch_span_mask(p_pre, attention_mask, cfg.mlm_probability)
@@ -685,63 +768,34 @@ class SBERTaForPreTraining(nn.Module):
             rtd_preds = (rtd_logits[real] > 0.0).float()
             rtd_acc = (rtd_preds == is_replaced[real]).float().mean().item()
 
-        # ── Geometric Burn-In ────────────────────────────────────────────
-        # L_smooth is gated off for the first burnin_ratio*total_steps so
-        # prototypes can separate geometrically (driven by L_div alone) before
-        # temporal stickiness starts pulling them together.
-        # If total_steps=0 (fine-tuning/inference), disable curriculum.
-        burnin_steps = int(cfg.burnin_ratio * total_steps) if total_steps > 0 else 0
-        in_burnin = global_step < burnin_steps
-
         # ── L_smooth (unsupervised temporal stickiness) ───────────────────
-        if in_burnin or total_steps == 0:
-            smooth_weight = 0.0
-            loss_smooth = input_ids.new_zeros(())
+        # Mask cross-document boundaries when segment_ids is provided
+        if segment_ids is not None:
+            cross_doc = segment_ids[:, 1:] != segment_ids[:, :-1]    # (B, T-1)
+            switch_mask = real[:, 1:] & real[:, :-1] & ~cross_doc    # (B, T-1)
         else:
-            # Curriculum ramp: smooth_weight_min → 1.0 over smooth_warmup_ratio*total_steps
-            warmup_steps = int(cfg.smooth_warmup_ratio * total_steps)
-            smooth_weight = cfg.smooth_weight_min + (1.0 - cfg.smooth_weight_min) * min(
-                1.0,
-                (global_step - burnin_steps) / max(1, warmup_steps),
-            )
-            # Mask cross-document boundaries when segment_ids is provided
-            if segment_ids is not None:
-                cross_doc = segment_ids[:, 1:] != segment_ids[:, :-1]    # (B, T-1)
-                switch_mask = real[:, 1:] & real[:, :-1] & ~cross_doc    # (B, T-1)
-            else:
-                switch_mask = real[:, 1:] & real[:, :-1]                 # (B, T-1)
-            if switch_mask.any():
-                loss_smooth = s_pre[:, 1:][switch_mask].mean()
-            else:
-                loss_smooth = input_ids.new_zeros(())
-
-        # ── L_sharp (per-token prototype commitment) ──────────────────────
-        loss_sharp = input_ids.new_zeros(())
-
-        # ── L_div ────────────────────────────────────────────────────────
-        loss_div = self.sberta.prototypes.diversity_loss()
-
-        # ── L_balance (soft minimum-usage) ───────────────────────────────
-        p0_real = p_pre[real]
-        mean_usage_batch = p0_real.mean(dim=0)
-        min_usage = cfg.balance_min_usage_factor / cfg.num_languages
+            switch_mask = real[:, 1:] & real[:, :-1]                 # (B, T-1)
         
-        if usage_ema is not None:
-            is_dying = (usage_ema.detach() < min_usage)
-            if is_dying.any():
-                loss_balance = F.relu(min_usage - mean_usage_batch[is_dying]).mean()
-            else:
-                loss_balance = mean_usage_batch.new_zeros(())
-        else:
-            loss_balance = F.relu(min_usage - mean_usage_batch).mean()
+        # Exclude cross-script boundaries (Arabic↔Latin) from smoothing penalty
+        if hasattr(self.sberta, "script_ids"):
+            s_left  = self.sberta.script_ids[input_ids[:, :-1]]
+            s_right = self.sberta.script_ids[input_ids[:, 1: ]]
+            both_known    = (s_left >= 0) & (s_right >= 0)
+            cross_script  = both_known & (s_left != s_right)
+            switch_mask   = switch_mask & ~cross_script
+        
+        loss_smooth = s_pre[:, 1:][switch_mask].mean() if switch_mask.any() else input_ids.new_zeros(())
+
+        # ── L_div (prototype diversity) ───────────────────────────────────
+        # Kept for future K>2 experiments; disabled by lambda_div=0.0 with script prior
+        loss_div = self.sberta.prototypes.diversity_loss() if cfg.lambda_div > 0 else input_ids.new_zeros(())
 
         # ── Combined loss ─────────────────────────────────────────────────
         loss = (
             loss_gen
             + cfg.rtd_weight * loss_rtd
-            + cfg.lambda_smooth * smooth_weight * loss_smooth
+            + cfg.lambda_smooth * loss_smooth
             + cfg.lambda_div * loss_div
-            + cfg.lambda_balance * loss_balance
         )
 
         return {
@@ -749,14 +803,11 @@ class SBERTaForPreTraining(nn.Module):
             "loss_gen":          loss_gen.item(),
             "loss_rtd":          loss_rtd.item(),
             "loss_smooth":       loss_smooth.item(),
-            "smooth_weight":     smooth_weight,
             "loss_div":          loss_div.item(),
-            "loss_sharp":        loss_sharp.item(),
-            "loss_balance":      loss_balance.item(),
             "rtd_acc":           rtd_acc,
             "n_masked":          n_masked,
-            "language_probs": p_pre,    # (B, T, K) — from unmasked input, consistent with losses
-            "switch_magnitudes": s_pre,        # (B, T) — from unmasked input, consistent with losses
+            "language_probs":    p_pre,    # (B, T, K) — from unmasked input, consistent with losses
+            "switch_magnitudes": s_pre,    # (B, T) — from unmasked input, consistent with losses
         }
 
     def _init_weights(self, module: nn.Module) -> None:
