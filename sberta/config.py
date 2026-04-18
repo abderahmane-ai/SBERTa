@@ -34,14 +34,14 @@ class SBERTaConfig:
     mlm_probability: float = 0.15      # fraction of tokens targeted by span masking (generator)
     rtd_weight: float = 50.0           # discriminator RTD loss coefficient (anchor - main training signal)
     generator_size_divisor: int = 4    # generator hidden_size = hidden_size // this (ELECTRA standard: d/4)
-    lambda_smooth: float = 15.0        # temporal stickiness weight (15:50 ratio vs RTD)
-    smooth_warmup_ratio: float = 0.10  # smooth curriculum ramp duration as fraction of total steps (default 10%)
+    lambda_smooth: float = 8.0         # temporal stickiness weight (reduced from 15.0 until div/balance are fixed)
+    smooth_warmup_ratio: float = 0.15  # smooth curriculum ramp duration as fraction of total steps (15% for gradual ramp)
     smooth_weight_min: float = 0.05    # smooth curriculum weight at end of burn-in (ramps to 1.0 over warmup)
-    burnin_ratio: float = 0.02         # burn-in duration as fraction of total steps (default 2%; L_smooth=0, only L_div)
-    lambda_div: float = 1.0            # prototype diversity weight
-    div_margin: float = 0.1            # cosine margin for diversity loss; fires even at near-orthogonal (cos≈0)
-    lambda_balance: float = 1.0        # soft minimum-usage weight: rescues dying prototypes
-    balance_min_usage_factor: float = 0.25  # per-prototype usage floor = factor/K (0.25 → 25% of uniform)
+    burnin_ratio: float = 0.05         # burn-in duration as fraction of total steps (5%; L_smooth=0, only L_div)
+    lambda_div: float = 5.0            # prototype diversity weight (increased from 1.0 with new log-barrier loss)
+    div_margin: float = 0.1            # [DEPRECATED] cosine margin for old diversity loss; kept for config compatibility
+    lambda_balance: float = 30.0       # soft minimum-usage weight: needs 30× increase to compete with smooth
+    balance_min_usage_factor: float = 0.5  # per-prototype usage floor = factor/K (0.5 → 50% of uniform = 12.5% for K=4)
 
     # ────────────────────────────────────────────────────────────────────
     def __post_init__(self) -> None:

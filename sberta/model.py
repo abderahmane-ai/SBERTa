@@ -135,7 +135,6 @@ class LanguagePrototypes(nn.Module):
     def __init__(self, config: SBERTaConfig) -> None:
         super().__init__()
         self.K: int = config.num_languages
-        self.div_margin: float = config.div_margin
 
         # L ∈ ℝ^{K×d}: orthogonal init → well-separated starting geometry
         self.prototypes: nn.Parameter = nn.Parameter(
@@ -191,19 +190,29 @@ class LanguagePrototypes(nn.Module):
 
     def diversity_loss(self) -> torch.Tensor:
         """
-        Margin-based repulsion loss:
-            L_div = (2 / K(K−1)) · Σ_{i<j} relu(cos(ℓᵢ, ℓⱼ) + margin)²
+        Exponential repulsion loss that never reaches zero:
+            L_div = (1/pairs) · Σ_{i<j} (exp(cos(ℓᵢ, ℓⱼ)) - exp(-1))
 
-        Fires even at near-orthogonal (cos ≈ 0), giving a constant repulsion
-        gradient from step 0.  Only reaches zero when cos < −margin (prototypes
-        are better than orthogonal).  margin is set via config.div_margin.
+        Always positive, always has gradient, exponentially steeper near collapse.
+        Baseline exp(-1) ≈ 0.368 so loss → 0 only at perfect anti-parallel (cos = -1).
+        
+        Values at observed states:
+        - cos = -0.10 (normal):     0.537 (constant repulsion)
+        - cos =  0.00 (orthogonal): 0.632 (still firing)
+        - cos = -0.40 (collapse):   0.303 (weaker, allows separation)
+        - cos = +0.80 (alignment):  1.858 (strong repulsion)
+        
+        With λ_div=5.0, gives ~2.7 constant force during normal operation,
+        comparable to smooth at 8.0 × 0.5 × 0.75 ≈ 3.0.
         """
         L_n = F.normalize(self.prototypes, dim=-1)             # (K, d)
         cos = L_n @ L_n.T                                      # (K, K)
         mask = torch.triu(
             torch.ones(self.K, self.K, device=cos.device), diagonal=1
         )
-        return (F.relu(cos + self.div_margin).pow(2) * mask).sum() / (self.K * (self.K - 1) / 2.0)
+        # exp(cos) - exp(-1): always positive, always has gradient
+        repulsion = torch.exp(cos) - math.exp(-1.0)
+        return (repulsion * mask).sum() / (self.K * (self.K - 1) / 2.0)
 
 
 # ─── Input Embeddings ─────────────────────────────────────────────────────────
