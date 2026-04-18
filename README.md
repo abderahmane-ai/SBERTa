@@ -40,13 +40,12 @@ python train_tokenizer.py \
 python pretrain.py \
   --config base \
   --corpus-dirs corpus \
-  --domain-weights "darija=0.7,wikipedia=0.3" \
   --tokenizer-dir runs/tokenizer \
-  --total-steps 150000 \
-  --batch-size 256 \
-  --grad-accum 2 \
+  --total-steps 1000000 \
+  --batch-size 512 \
+  --grad-accum 4 \
   --num-workers 16 \
-  --run-id sberta-rtx6000-v1
+  --run-id sberta-base-1m
 ```
 
 ### Fine-tune for Classification

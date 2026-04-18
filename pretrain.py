@@ -277,21 +277,23 @@ def resolve_corpus_paths(dirs: List[str]) -> List[Path]:
 
 def build_domain_buckets(corpus_paths: List[Path]) -> Dict[str, List[Path]]:
     """
-    Bucket corpus files into broad domains based on path components.
-
-    Current mapping:
-        wikipedia — any file whose path contains '/wikipedia/'
-        darija    — everything else (YouTube comments, native Darija, sentiment…)
-
-    Extend this function if you add more domains.
+    Bucket corpus files into domains based on path components.
+    
+    Optional feature for weighted domain sampling. If not used, all files
+    are sampled uniformly.
+    
+    Example bucketing (extend as needed):
+        social_media — files in /youtube/, /twitter/, /reddit/
+        news         — files in /news/, /articles/
+        formal       — files in /books/, /wikipedia/
+    
+    Current implementation: single 'darija' bucket (all files).
     """
-    buckets: Dict[str, List[Path]] = {"darija": [], "wikipedia": []}
+    buckets: Dict[str, List[Path]] = {"darija": []}
     for p in corpus_paths:
-        norm = p.as_posix().lower()
-        if "/wikipedia/" in norm:
-            buckets["wikipedia"].append(p)
-        else:
-            buckets["darija"].append(p)
+        # All files go to 'darija' bucket by default
+        # Extend this logic if you want to split by domain
+        buckets["darija"].append(p)
     return {k: v for k, v in buckets.items() if v}
 
 
@@ -300,7 +302,7 @@ def parse_domain_weights(spec: str) -> Dict[str, float]:
     Parse a comma-separated domain-weight string into a dict.
 
     Example:
-        "darija=0.7,wikipedia=0.3"  →  {"darija": 0.7, "wikipedia": 0.3}
+        "social_media=0.8,news=0.2"  →  {"social_media": 0.8, "news": 0.2}
     """
     out: Dict[str, float] = {}
     if not spec or not spec.strip():
@@ -865,7 +867,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--domain-weights", type=str, default="",
         help=(
-            "Optional weighted domain sampling, e.g. 'darija=0.7,wikipedia=0.3'. "
+            "Optional weighted domain sampling, e.g. 'social_media=0.8,news=0.2'. "
             "When omitted all files are sampled uniformly."
         ),
     )

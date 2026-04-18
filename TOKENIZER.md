@@ -214,11 +214,10 @@ Train a new SentencePiece model from scratch on your corpus:
 
 ```bash
 python train_tokenizer.py \
-    --input  corpus/*.txt corpus/wikipedia/*.txt corpus/youtube/*.txt \
+    --input  corpus/darija_corpus_clean.txt \
     --output runs/tokenizer/ \
     --vocab_size  50265 \
-    --num_threads 8 \
-    --min_chars   5
+    --num_threads 8
 ```
 
 The script will:
