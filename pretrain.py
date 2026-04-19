@@ -172,46 +172,6 @@ class StreamingTextDataset(IterableDataset):
                 yield from self._iter_file(path)
 
 
-class DomainWeightedStreamingDataset(IterableDataset):
-    """
-    Infinite weighted mixture over named domain datasets.
-
-    At each call to __next__ a domain is sampled proportional to its weight,
-    then one sample is drawn from that domain's iterator. Exhausted iterators
-    are silently restarted. Each DataLoader worker gets its own seeded RNG.
-
-    Args:
-        domain_datasets: domain name → StreamingTextDataset.
-        domain_weights:  domain name → unnormalised sampling weight.
-    """
-
-    def __init__(
-        self,
-        domain_datasets: Dict[str, "StreamingTextDataset"],
-        domain_weights: Dict[str, float],
-    ) -> None:
-        super().__init__()
-        self.domains = list(domain_datasets.keys())
-        self.datasets = domain_datasets
-        total = sum(domain_weights[d] for d in self.domains)
-        self.probs = [domain_weights[d] / total for d in self.domains]
-
-    def __iter__(self) -> Iterator[dict]:
-        worker_info = torch.utils.data.get_worker_info()
-        seed = int(torch.initial_seed() % (2 ** 32))
-        if worker_info is not None:
-            seed ^= worker_info.id
-        rng = random.Random(seed)
-
-        iters = {d: iter(self.datasets[d]) for d in self.domains}
-        while True:
-            (domain,) = rng.choices(self.domains, weights=self.probs, k=1)
-            try:
-                yield next(iters[domain])
-            except StopIteration:
-                iters[domain] = iter(self.datasets[domain])
-                yield next(iters[domain])
-
 
 def collate_fn(batch: List[dict], pad_id: int) -> dict:
     """Collate variable-length samples into a padded batch."""
@@ -289,50 +249,6 @@ def resolve_corpus_paths(dirs: List[str]) -> List[Path]:
     log.info("Corpus: %d files, %.1f MB total", len(paths), total_mb)
     return paths
 
-
-def build_domain_buckets(corpus_paths: List[Path]) -> Dict[str, List[Path]]:
-    """
-    Bucket corpus files into domains based on path components.
-
-    Current implementation: single 'darija' bucket (all files).
-    Extend path-component logic here for multi-domain weighted sampling.
-    """
-    buckets: Dict[str, List[Path]] = {"darija": []}
-    for p in corpus_paths:
-        buckets["darija"].append(p)
-    return {k: v for k, v in buckets.items() if v}
-
-
-def parse_domain_weights(spec: str) -> Dict[str, float]:
-    """
-    Parse a comma-separated domain-weight string into a dict.
-
-    Example:
-        "social_media=0.8,news=0.2"  →  {"social_media": 0.8, "news": 0.2}
-    """
-    out: Dict[str, float] = {}
-    if not spec or not spec.strip():
-        return out
-    for part in spec.split(","):
-        item = part.strip()
-        if not item:
-            continue
-        if "=" not in item:
-            raise ValueError(
-                f"Invalid domain weight spec '{item}'. Expected key=value."
-            )
-        key, raw_val = item.split("=", 1)
-        domain = key.strip().lower()
-        try:
-            weight = float(raw_val.strip())
-        except ValueError as exc:
-            raise ValueError(
-                f"Invalid weight value '{raw_val}' for domain '{domain}'."
-            ) from exc
-        if weight <= 0:
-            raise ValueError(f"Weight must be > 0; got {weight} for '{domain}'.")
-        out[domain] = weight
-    return out
 
 
 # ─── Checkpointing ────────────────────────────────────────────────────────────
@@ -419,7 +335,6 @@ def train(
     # Data
     corpus_dirs: Optional[List[str]] = None,
     tokenizer_dir: str = "runs/tokenizer",
-    domain_weights: Optional[Dict[str, float]] = None,
     # Optimisation
     total_steps: int = 150_000,
     warmup_steps: int = 3_000,
@@ -515,35 +430,9 @@ def train(
         corpus_dirs = ["corpus"]
     corpus_paths = resolve_corpus_paths(corpus_dirs)
 
-    if domain_weights:
-        domain_paths = build_domain_buckets(corpus_paths)
-        active: Dict[str, float] = {}
-        for domain, weight in domain_weights.items():
-            if domain not in domain_paths:
-                log.warning(
-                    "Domain '%s' specified in --domain-weights but no files "
-                    "bucketed into it — skipping.",
-                    domain,
-                )
-                continue
-            active[domain] = weight
-        if not active:
-            raise ValueError(
-                f"No active weighted domains found. "
-                f"Domains with files: {sorted(domain_paths.keys())}."
-            )
-        log.info("Domain sampling: %s", active)
-        domain_datasets = {
-            d: StreamingTextDataset(
-                domain_paths[d], tokenizer, max_length, shuffle_files=True
-            )
-            for d in active
-        }
-        dataset = DomainWeightedStreamingDataset(domain_datasets, active)
-    else:
-        dataset = StreamingTextDataset(
-            corpus_paths, tokenizer, max_length, shuffle_files=True
-        )
+    dataset = StreamingTextDataset(
+        corpus_paths, tokenizer, max_length, shuffle_files=True
+    )
 
     # ── DataLoader ────────────────────────────────────────────────────────
     loader = DataLoader(
@@ -855,13 +744,6 @@ def parse_args() -> argparse.Namespace:
         help="Corpus directories or individual .txt file paths.",
     )
     p.add_argument(
-        "--domain-weights", type=str, default="",
-        help=(
-            "Optional weighted domain sampling, e.g. 'social_media=0.8,news=0.2'. "
-            "When omitted all files are sampled uniformly."
-        ),
-    )
-    p.add_argument(
         "--tokenizer-dir", default="runs/tokenizer",
         help="Directory containing sberta.model.",
     )
@@ -890,7 +772,6 @@ if __name__ == "__main__":
         model_config_name=args.config,
         corpus_dirs=args.corpus_dirs,
         tokenizer_dir=args.tokenizer_dir,
-        domain_weights=parse_domain_weights(args.domain_weights) or None,
         total_steps=args.total_steps,
         warmup_steps=args.warmup_steps,
         batch_size=args.batch_size,
