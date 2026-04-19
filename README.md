@@ -12,17 +12,15 @@ While originally designed for Algerian Darija (Arabic script, Latin script, Fren
 
 Standard multilingual models treat code-switching as noise. SBERTa treats it as a structural signal.
 
-**Language Prototypes & Sinkhorn-Knopp** — The model learns K prototype vectors representing language directions in embedding space. To prevent the prototypes from collapsing into a single language without relying on hardcoded rules, SBERTa uses **Optimal Transport (Sinkhorn-Knopp)**. This mathematically guarantees that the model discovers exactly K distinct linguistic clusters from the data distribution itself.
+**Two-Phase Encoder** — SBERTa avoids the "bootstrap paradox" of early clustering. Phase 1 uses standard attention to build semantic context. Language prototypes are assigned from these contextual outputs at a pivot layer, before Phase 2 applies language-aware attention.
 
-**Zero-Knowledge Clustering** — SBERTa requires no Unicode priors or dictionaries. Language structure emerges purely from the Masked Language Modeling (MLM) objective, stabilized by the Sinkhorn clustering loss. It works on multi-script and mono-script mixtures equally well.
+**Language Prototypes & Sinkhorn-Knopp** — The model learns K prototype vectors. To prevent collapse, SBERTa uses **Optimal Transport (Sinkhorn-Knopp)**. Crucially, it uses an **Adaptive EMA Prior** to track the batch marginals, allowing the model to dynamically discover the true language distribution of the corpus without forcing a 50/50 split.
 
-**Switch Magnitudes** — A continuous scalar per token measuring how much the language distribution changed from the previous token. Zero means same language, one means complete switch. Fully differentiable.
+**Zero-Knowledge Clustering** — SBERTa requires no Unicode priors or dictionaries. Language structure emerges purely from the Masked Language Modeling (MLM) objective, stabilized by the Sinkhorn clustering loss.
 
-**Language-Aware Attention** — Each attention head has a K×K compatibility matrix that learns asymmetric language affinities. An Arabic query attending to a Latin key gets a different bias than the reverse. The switch magnitude adds a second bias toward boundary positions.
+**Language-Aware Attention** — Each attention head in Phase 2 has a K×K compatibility matrix that learns asymmetric language affinities. An Arabic query attending to a Latin key gets a different bias than the reverse.
 
-**GDES & ELECTRA-style Pre-training** — A small generator proposes token replacements via geometric span masking; the full discriminator detects them at every real token position. SBERTa solves the notorious ELECTRA instability via **Gradient-Disentangled Embedding Sharing (GDES)**. The discriminator's gradients do not flow into the token embeddings, ending the gradient tug-of-war and allowing the generator to build clean semantic clusters for the Sinkhorn algorithm to discover.
-
-**Temporal Stickiness** — An unsupervised loss penalizes high switch magnitudes at within-sequence boundaries, acting as a Markov prior that pushes prototypes toward long, linguistically coherent spans.
+**GDES & ELECTRA-style Pre-training** — A small generator proposes token replacements via geometric span masking; the discriminator detects them. SBERTa solves ELECTRA instability via **Gradient-Disentangled Embedding Sharing (GDES)**. The discriminator's gradients do not flow into the token embeddings, allowing the generator to build clean semantic clusters for the Sinkhorn algorithm to discover.
 
 ---
 
@@ -32,10 +30,11 @@ Full mathematical specification in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 The short version:
 
+- **Two-Phase Encoder:** Phase 1 builds language-agnostic contextual representations. The language pivot assigns prototypes based on context. Phase 2 applies language-aware attention.
 - **Embeddings:** GDES. Token embeddings are shaped purely by the Generator.
 - **Generator Masking:** Standard geometric span masking independent of language predictions.
-- **Language Discovery:** p⁽⁰⁾ is computed from tok+pos embeddings. Sinkhorn-Knopp balances the assignments, and a clustering loss aligns p⁽⁰⁾ with the balanced targets.
-- **Attention:** Language-aware attention routes information based on the discovered clusters.
+- **Language Discovery:** p is computed from Phase 1 contextual outputs. Sinkhorn-Knopp clusters them using an adaptive EMA prior that discovers the true corpus language distribution online.
+- **Attention:** Phase 2 routes information based on the discovered clusters via per-head K×K compatibility matrices.
 - **Pooling:** No [CLS] token. Sentence representations use mean pooling over real token positions.
 
 ---

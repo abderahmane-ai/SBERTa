@@ -2,9 +2,8 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Optional
 
 
 @dataclass
@@ -22,13 +21,34 @@ class SBERTaConfig:
     intermediate_size: int = 3072
     layer_norm_eps: float = 1e-12
 
+    # ── Two-phase encoder ─────────────────────────────────────────────────
+    # Phase 1 (layers 0 … n_base_layers−1): standard attention, no language
+    # bias injected. MLM/RTD distributional pressure forces language-clustered
+    # representations to emerge naturally, as in multilingual BERT.
+    #
+    # Language prototypes are assigned from Phase 1 output — contextual and
+    # meaningful — before any language signal enters the attention stack.
+    #
+    # Phase 2 (layers n_base_layers … num_hidden_layers−1): language-aware
+    # attention with per-head K×K compatibility matrices and switch bias.
+    # p is a real signal by the time it reaches these layers.
+    #
+    # Constraint: 0 < n_base_layers < num_hidden_layers.
+    n_base_layers: int = 6
+
     # ── Code-switching ────────────────────────────────────────────────────
     num_languages: int = 2
-    proto_temperature: float = 0.5   # fixed; learnable=False avoids tau decay
-                                     # sharpening Sinkhorn inputs past convergence
+    proto_temperature: float = 0.5   # stored as log_τ; learnable=False avoids
+                                     # tau decay that sharpens Sinkhorn past
+                                     # convergence
     learnable_temperature: bool = False
 
-    prototype_prior: Optional[list] = field(default_factory=lambda: [0.90, 0.10])
+    # ── Prototype prior — adaptive EMA ────────────────────────────────────
+    # Initialised to uniform (1/K); updated each forward pass from the
+    # Sinkhorn batch marginals. Converges to the true corpus language
+    # distribution within ~500 optimiser steps without any hardcoded signal.
+    # Works on any K-language mixture at any corpus proportion.
+    prior_ema_momentum: float = 0.99
 
     # ── Regularisation ────────────────────────────────────────────────────
     hidden_dropout_prob: float = 0.1
@@ -45,17 +65,22 @@ class SBERTaConfig:
     span_mask_max_len: int = 10
 
     # Sinkhorn-Knopp clustering (SwAV-style collapse prevention)
-    sinkhorn_epsilon: float = 0.1    # was 0.05; softer targets stable under sharp inputs
-    sinkhorn_iters: int = 20         # was 3; must converge at all input scales
+    sinkhorn_epsilon: float = 0.1
+    sinkhorn_iters: int = 20
 
-    lambda_smooth: float = 5.0
-    lambda_cluster: float = 5.0     # was 1.0; must dominate early before RTD
+    # ── Loss weights ──────────────────────────────────────────────────────
+    lambda_cluster: float = 3.0   # Sinkhorn prototype equipartition
+    lambda_ortho:   float = 1.0   # prototype geometry: (L_n L_nᵀ − I)² mean
 
-    # ────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
     def __post_init__(self) -> None:
         assert self.hidden_size % self.num_attention_heads == 0, (
             f"hidden_size ({self.hidden_size}) must be divisible by "
             f"num_attention_heads ({self.num_attention_heads})"
+        )
+        assert 0 < self.n_base_layers < self.num_hidden_layers, (
+            f"n_base_layers ({self.n_base_layers}) must satisfy "
+            f"0 < n_base_layers < num_hidden_layers ({self.num_hidden_layers})"
         )
 
     def save(self, path: str | Path) -> None:
@@ -75,12 +100,13 @@ class SBERTaConfig:
             num_hidden_layers=4,
             num_attention_heads=4,
             intermediate_size=1024,
+            n_base_layers=2,
         )
 
     @classmethod
     def base(cls) -> "SBERTaConfig":
         """BERT-base equivalent size (~124 M params)."""
-        return cls()            # all defaults
+        return cls()            # all defaults; n_base_layers=6 of 12
 
     @classmethod
     def medium(cls) -> "SBERTaConfig":
@@ -90,6 +116,7 @@ class SBERTaConfig:
             num_hidden_layers=8,
             num_attention_heads=8,
             intermediate_size=2048,
+            n_base_layers=4,
         )
 
     @classmethod
@@ -100,4 +127,5 @@ class SBERTaConfig:
             num_hidden_layers=24,
             num_attention_heads=16,
             intermediate_size=4096,
+            n_base_layers=12,
         )

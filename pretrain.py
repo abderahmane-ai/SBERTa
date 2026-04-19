@@ -18,28 +18,32 @@ Full run:
 
 Architecture
 ------------
-SBERTa uses ELECTRA-style Replaced Token Detection (RTD) pre-training.
+SBERTa uses a two-phase encoder with ELECTRA-style Replaced Token Detection (RTD).
 
-The model handles ALL masking and corruption internally.  The dataset only
-needs to return raw (unmasked) token sequences.  Do NOT apply any masking
-in the dataset or pass any external switch labels — the model discovers
-language boundaries autonomously via the unsupervised L_smooth loss.
+Phase 1 (n_base_layers standard attention layers) builds contextual representations
+with no language signal injected. Language prototypes are assigned from Phase 1
+output — contextual and meaningful — before entering Phase 2's language-aware
+attention stack. This eliminates the bootstrap paradox present in architectures
+that inject language distributions into raw token embeddings.
+
+The model handles ALL masking and corruption internally. The dataset only needs
+to return raw (unmasked) token sequences. Do NOT apply any masking externally.
 
 Combined loss:
-    L = L_gen  +  w_rtd · L_RTD  +  λ_smooth · L_smooth  +  λ_cluster · L_cluster
+    L = L_gen  +  w_rtd · L_RTD  +  λ_cluster · L_cluster  +  λ_ortho · L_ortho
 
     L_gen        : generator MLM on geometrically-masked spans
     L_RTD        : discriminator real/replaced BCE at every real token
                    (6–7× more gradient signal than vanilla MLM)
-    L_smooth     : unsupervised temporal stickiness — mean switch magnitude
-                   penalised at all within-sequence boundaries
-    L_cluster    : Sinkhorn-Knopp prototype equipartition — mathematically
-                   guarantees K distinct clusters without collapse or burn-in
+    L_cluster    : Sinkhorn-Knopp on Phase 1 contextual representations;
+                   prototype prior is adaptive EMA, discovering the true corpus
+                   language distribution within ~500 steps automatically
+    L_ortho      : (L_n L_nᵀ − I)².mean() — directly regularises prototype
+                   geometry; prevents prototype vectors from drifting together
+                   independently of the assignment dynamics
 
 The model is fully zero-knowledge: no Unicode priors, no script IDs, no
-dictionaries. Language structure emerges purely from the MLM distributional
-objective, stabilised by the Sinkhorn clustering loss. Works on any
-K-language mixture (Darija, Spanglish, Hinglish, Franglais, etc.).
+dictionaries. Works on any K-language mixture (Darija, Spanglish, Hinglish, etc.).
 
 Checkpointing
 -------------
@@ -89,7 +93,7 @@ class StreamingTextDataset(IterableDataset):
     Reads plain-text UTF-8 corpus files (one sentence/segment per line),
     tokenises with SBERTaTokenizer, and yields individual samples as dicts.
     Masking and language-boundary detection are handled by the model —
-    this class returns raw token ids only (no switch labels required).
+    this class returns raw token ids only.
 
     Args:
         corpus_paths:  list of plain-text corpus files.
@@ -149,14 +153,10 @@ class StreamingTextDataset(IterableDataset):
 
     def _get_worker_paths(self) -> List[Path]:
         """
-        Return this DataLoader worker's file shard, reshuffled on every call
-        (so each pass through the data uses a different file order).
+        Return this DataLoader worker's file shard, reshuffled on every call.
 
-        When num_workers > 0, PyTorch forks N worker processes each of which
-        calls __iter__ independently.  Without sharding every worker would
-        stream the same files, effectively multiplying the corpus N-fold.
         Interleaved sharding (paths[id::num_workers]) gives each worker a
-        disjoint subset with balanced coverage across domains.
+        disjoint subset of files with balanced domain coverage.
         """
         worker_info = torch.utils.data.get_worker_info()
         paths = list(self.paths)
@@ -164,11 +164,9 @@ class StreamingTextDataset(IterableDataset):
             random.shuffle(paths)
         if worker_info is None:
             return paths
-        # Interleaved sharding: worker i gets paths[i], paths[i+n], paths[i+2n], …
         return paths[worker_info.id :: worker_info.num_workers]
 
     def __iter__(self) -> Iterator[dict]:
-        # Loop forever so DataLoader never raises StopIteration mid-training.
         while True:
             for path in self._get_worker_paths():
                 yield from self._iter_file(path)
@@ -179,11 +177,8 @@ class DomainWeightedStreamingDataset(IterableDataset):
     Infinite weighted mixture over named domain datasets.
 
     At each call to __next__ a domain is sampled proportional to its weight,
-    then one sample is drawn from that domain's iterator.  Exhausted iterators
-    are silently restarted so the stream is infinite.
-
-    Each DataLoader worker gets its own seeded RNG so workers produce
-    independent domain sequences rather than identical correlated ones.
+    then one sample is drawn from that domain's iterator. Exhausted iterators
+    are silently restarted. Each DataLoader worker gets its own seeded RNG.
 
     Args:
         domain_datasets: domain name → StreamingTextDataset.
@@ -202,11 +197,10 @@ class DomainWeightedStreamingDataset(IterableDataset):
         self.probs = [domain_weights[d] / total for d in self.domains]
 
     def __iter__(self) -> Iterator[dict]:
-        # Give each worker an independent RNG so domain sequences diverge.
         worker_info = torch.utils.data.get_worker_info()
         seed = int(torch.initial_seed() % (2 ** 32))
         if worker_info is not None:
-            seed ^= worker_info.id          # xor with worker id for independence
+            seed ^= worker_info.id
         rng = random.Random(seed)
 
         iters = {d: iter(self.datasets[d]) for d in self.domains}
@@ -220,12 +214,7 @@ class DomainWeightedStreamingDataset(IterableDataset):
 
 
 def collate_fn(batch: List[dict], pad_id: int) -> dict:
-    """
-    Collate a list of variable-length samples into a padded batch.
-
-    Padding strategy: pad to the length of the longest sequence in the batch
-    (not to max_length) to avoid wasting compute on short-sequence batches.
-    """
+    """Collate variable-length samples into a padded batch."""
     T = max(item["input_ids"].size(0) for item in batch)
     B = len(batch)
 
@@ -270,10 +259,7 @@ def cosine_schedule_with_warmup(
 
 
 def resolve_corpus_paths(dirs: List[str]) -> List[Path]:
-    """
-    Expand a list of directory paths or .txt file paths into a deduplicated
-    flat list of .txt files.
-    """
+    """Expand directory/file paths into a deduplicated flat list of .txt files."""
     paths: List[Path] = []
     seen: set = set()
     for d in dirs:
@@ -307,21 +293,12 @@ def resolve_corpus_paths(dirs: List[str]) -> List[Path]:
 def build_domain_buckets(corpus_paths: List[Path]) -> Dict[str, List[Path]]:
     """
     Bucket corpus files into domains based on path components.
-    
-    Optional feature for weighted domain sampling. If not used, all files
-    are sampled uniformly.
-    
-    Example bucketing (extend as needed):
-        social_media — files in /youtube/, /twitter/, /reddit/
-        news         — files in /news/, /articles/
-        formal       — files in /books/, /wikipedia/
-    
+
     Current implementation: single 'darija' bucket (all files).
+    Extend path-component logic here for multi-domain weighted sampling.
     """
     buckets: Dict[str, List[Path]] = {"darija": []}
     for p in corpus_paths:
-        # All files go to 'darija' bucket by default
-        # Extend this logic if you want to split by domain
         buckets["darija"].append(p)
     return {k: v for k, v in buckets.items() if v}
 
@@ -373,9 +350,8 @@ def save_checkpoint(
     """
     Save a full training checkpoint and update the `latest` pointer file.
 
-    The `latest` file is a plain-text file containing the absolute path of the
-    most recent checkpoint directory.  Plain text is used instead of a symlink
-    for cross-platform compatibility.
+    The `latest` file is a plain-text file containing the absolute path of
+    the most recent checkpoint directory (cross-platform; no symlinks).
     """
     ckpt_dir = run_dir / f"step-{step:07d}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -404,8 +380,8 @@ def load_latest_checkpoint(
     Load the most recent checkpoint if one exists.
 
     Returns:
-        (global_step, ckpt_dir): The global step to resume from (0 if no checkpoint),
-                                  and the checkpoint directory path (None if no checkpoint).
+        (global_step, ckpt_dir): step to resume from (0 if none),
+                                  and the checkpoint directory (None if none).
     """
     latest_file = run_dir / "latest"
     if not latest_file.exists():
@@ -432,7 +408,6 @@ def load_latest_checkpoint(
     step = int(metrics.get("step", 0))
     log.info("Resumed from %s (step %d)", ckpt_dir, step)
     return step, ckpt_dir
-
 
 
 # ─── Training Loop ────────────────────────────────────────────────────────────
@@ -467,11 +442,7 @@ def train(
     from sberta.model import SBERTaForPreTraining
     from sberta.tokenizer import SBERTaTokenizer
 
-    # ── Memory allocator fix (prevents fragmentation OOM) ─────────────────
-    # PyTorch's default allocator can accumulate large reserved-but-unallocated
-    # blocks during training, causing OOM even when total usage is well below
-    # GPU capacity.  expandable_segments:True allows the allocator to grow
-    # segments incrementally, eliminating fragmentation-induced crashes.
+    # Prevents fragmentation-induced OOM under PyTorch's default allocator.
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     # ── Device ────────────────────────────────────────────────────────────
@@ -495,20 +466,22 @@ def train(
         )
     config = config_factory[model_config_name]()
     log.info(
-        "Config: %s | d=%d  L=%d  H=%d  ffn=%d  V=%d  K=%d",
+        "Config: %s | d=%d  L=%d (base=%d lang=%d)  H=%d  ffn=%d  V=%d  K=%d",
         model_config_name,
         config.hidden_size,
         config.num_hidden_layers,
+        config.n_base_layers,
+        config.num_hidden_layers - config.n_base_layers,
         config.num_attention_heads,
         config.intermediate_size,
         config.vocab_size,
         config.num_languages,
     )
     log.info(
-        "Loss weights: w_rtd=%.1f  λ_smooth=%.3f  λ_cluster=%.3f",
+        "Loss weights: w_rtd=%.1f  λ_cluster=%.3f  λ_ortho=%.3f",
         config.rtd_weight,
-        config.lambda_smooth,
         config.lambda_cluster,
+        config.lambda_ortho,
     )
     log.info(
         "Span masking: geo_p=%.2f  min=%d  max=%d  (mean span %.1f tokens)",
@@ -523,11 +496,10 @@ def train(
         config.sinkhorn_iters,
         config.lambda_cluster,
     )
-    if config.prototype_prior is not None:
-        prior_str = "  ".join(f"p{i}={v:.3f}" for i, v in enumerate(config.prototype_prior))
-        log.info("Prototype prior (corpus-proportional): %s", prior_str)
-    else:
-        log.info("Prototype prior: uniform (1/K) — zero-knowledge mode")
+    log.info(
+        "Prototype prior: adaptive EMA (momentum=%.3f) — initialised uniform (1/K)",
+        config.prior_ema_momentum,
+    )
 
     # ── Tokenizer ─────────────────────────────────────────────────────────
     tokenizer = SBERTaTokenizer.from_pretrained(tokenizer_dir)
@@ -591,14 +563,14 @@ def train(
 
     # ── Mixed precision ────────────────────────────────────────────────────
     use_amp = device.type == "cuda"
-    scaler = torch.amp.GradScaler(device=device.type, enabled=use_amp)
+    scaler  = torch.amp.GradScaler(device=device.type, enabled=use_amp)
 
     # ── Optimiser ─────────────────────────────────────────────────────────
     # Parameters excluded from weight decay:
     #   · 1-D tensors (LayerNorm weight/bias, all bias vectors)
     #   · prototype vectors L ∈ ℝ^{K×d}  (geometry, not scale)
-    #   · switch_embedding  e^{sw}
-    #   · log_tau            (temperature; scalar)
+    #   · log_tau (temperature scalar)
+    #   · compat matrices (K×K language compatibility, Phase 2)
     decay_params: List[torch.Tensor] = []
     no_decay_params: List[torch.Tensor] = []
     for name, param in model.named_parameters():
@@ -608,9 +580,8 @@ def train(
             param.ndim == 1
             or name.endswith(".bias")
             or "prototypes.prototypes" in name
-            or "switch_embedding" in name
             or "log_tau" in name
-            or ".compat" in name             # K×K language compatibility matrices
+            or ".compat" in name
         ):
             no_decay_params.append(param)
         else:
@@ -643,11 +614,10 @@ def train(
     model.train()
     optimizer.zero_grad()
 
-    # Loss accumulators — reset every log_every optimizer steps.
-    LOSS_KEYS = ("loss", "loss_gen", "loss_rtd", "loss_smooth", "loss_cluster")
+    LOSS_KEYS = ("loss", "loss_gen", "loss_rtd", "loss_cluster", "loss_ortho")
     acc: Dict[str, float] = {k: 0.0 for k in LOSS_KEYS}
     rtd_acc_sum: float = 0.0
-    n_masked_acc: int = 0
+    n_masked_acc: int  = 0
 
     # Prototype usage (token-level dominant prototype counts)
     proto_counts = torch.zeros(config.num_languages, device=device)
@@ -661,21 +631,18 @@ def train(
     # AMP health tracking
     consecutive_skips: int = 0
 
-    # Last logged metrics (used if a checkpoint fires before first log window)
     last_metrics: dict = {"step": global_step}
 
     t0 = time.perf_counter()
-    log.info("Training steps: %d → %d  (effective batch = %d)",
-             global_step, total_steps, batch_size * grad_accum)
+    log.info(
+        "Training steps: %d → %d  (effective batch = %d)",
+        global_step, total_steps, batch_size * grad_accum,
+    )
 
     data_iter = iter(loader)
 
     while global_step < total_steps:
 
-        # ── Gradient-accumulation micro-steps ─────────────────────────────
-        # Accumulate gradients over `grad_accum` micro-batches before calling
-        # optimizer.step().  Loss components are averaged across micro-batches
-        # for each optimizer step, then accumulated across steps for logging.
         step_acc: Dict[str, float] = {k: 0.0 for k in LOSS_KEYS}
         step_n_masked: int = 0
 
@@ -688,7 +655,10 @@ def train(
 
             input_ids      = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-            segment_ids    = batch["segment_ids"].to(device, non_blocking=True) if "segment_ids" in batch else None
+            segment_ids    = (
+                batch["segment_ids"].to(device, non_blocking=True)
+                if "segment_ids" in batch else None
+            )
 
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 out = model(
@@ -703,27 +673,23 @@ def train(
             step_acc["loss"] += out["loss"].item() / grad_accum
             for k in LOSS_KEYS[1:]:
                 step_acc[k] += out[k] / grad_accum
-            step_n_masked += out["n_masked"]
-            rtd_acc_sum += out["rtd_acc"] / grad_accum
+            step_n_masked  += out["n_masked"]
+            rtd_acc_sum    += out["rtd_acc"] / grad_accum
 
-            # Prototype usage and switch stats (no grad needed)
             with torch.no_grad():
                 real_mask = attention_mask.bool()
 
-                # Dominant prototype per real token
-                dominant = out["language_probs"].argmax(-1)[real_mask]  # (N_real,)
+                dominant = out["language_probs"].argmax(-1)[real_mask]
                 proto_counts += torch.bincount(
                     dominant, minlength=config.num_languages
                 ).float()
                 total_tokens += dominant.numel()
 
-                # Switch magnitudes from the discriminator forward
-                sw = out["switch_magnitudes"][real_mask]  # (N_real,)
+                sw = out["switch_magnitudes"][real_mask]
                 sw_sum += sw.sum().item()
                 sw_max  = max(sw_max, sw.max().item())
                 sw_n   += sw.numel()
 
-        # Accumulate step-level averages into the logging window
         for k in LOSS_KEYS:
             acc[k] += step_acc[k]
         n_masked_acc += step_n_masked // grad_accum
@@ -737,8 +703,6 @@ def train(
         scaler.update()
         optimizer.zero_grad()
 
-        # Only advance the LR schedule when the optimiser actually stepped
-        # (AMP skips the step if NaN/Inf gradients are detected).
         if scaler.get_scale() < scale_before:
             consecutive_skips += 1
             log.warning(
@@ -760,16 +724,14 @@ def train(
 
         # ── Periodic logging ──────────────────────────────────────────────
         if global_step % log_every == 0:
-            elapsed = time.perf_counter() - t0
+            elapsed       = time.perf_counter() - t0
             steps_per_sec = log_every / elapsed
             tok_per_sec   = steps_per_sec * batch_size * grad_accum * max_length
             lr_now        = scheduler.get_last_lr()[0]
             avg           = {k: acc[k] / log_every for k in LOSS_KEYS}
 
-            # Generator perplexity (cap exponent to avoid overflow)
             ppl = math.exp(min(avg["loss_gen"], 20.0))
 
-            # Learnable temperature τ
             with torch.no_grad():
                 tau_val = model.sberta.prototypes.tau.item()
 
@@ -779,25 +741,22 @@ def train(
                 proto_str = "  ".join(
                     f"p{i}={pct[i]:.1f}%" for i in range(config.num_languages)
                 )
-                # Prototype usage entropy — monitors collapse
-                usage = proto_counts / total_tokens
-                entropy = -(usage * (usage + 1e-9).log()).sum().item()
-                max_entropy = math.log(config.num_languages)
-                entropy_pct = entropy / max_entropy * 100.0
+                usage     = proto_counts / total_tokens
+                entropy   = -(usage * (usage + 1e-9).log()).sum().item()
+                max_ent   = math.log(config.num_languages)
+                entropy_pct = entropy / max_ent * 100.0
                 if entropy_pct < 80.0:
                     log.warning(
                         "⚠️  Prototype collapse! Entropy %.1f%% (target >80%%)",
                         entropy_pct,
                     )
             else:
-                proto_str = "N/A"
+                proto_str   = "N/A"
                 entropy_pct = 0.0
 
-            # Pairwise prototype cosine similarities — monitors diversity loss
+            # Pairwise prototype cosine similarities
             with torch.no_grad():
-                L_n = F.normalize(
-                    model.sberta.prototypes.prototypes, dim=-1
-                )  # (K, d)
+                L_n     = F.normalize(model.sberta.prototypes.prototypes, dim=-1)
                 cos_mat = (L_n @ L_n.T).cpu()
                 cos_pairs = [
                     f"({i},{j})={cos_mat[i, j].item():.3f}"
@@ -806,21 +765,26 @@ def train(
                 ]
                 cos_str = "  ".join(cos_pairs)
 
-            # Switch magnitude stats
+            # Adaptive EMA prior — shows discovered corpus distribution
+            with torch.no_grad():
+                prior_str = "  ".join(
+                    f"p{i}={model._prototype_prior[i].item():.3f}"
+                    for i in range(config.num_languages)
+                )
+
             sw_mean_str = f"{sw_sum / sw_n:.4f}" if sw_n > 0 else "N/A"
             sw_max_str  = f"{sw_max:.4f}"         if sw_n > 0 else "N/A"
 
-            # GPU memory
             if device.type == "cuda":
-                mem_a = torch.cuda.memory_allocated() / 1e9
-                mem_r = torch.cuda.memory_reserved()  / 1e9
+                mem_a   = torch.cuda.memory_allocated() / 1e9
+                mem_r   = torch.cuda.memory_reserved()  / 1e9
                 mem_str = f" | mem {mem_a:.1f}/{mem_r:.1f} GB"
             else:
                 mem_str = ""
 
             log.info(
                 "step %7d/%d  loss %.4f "
-                "[gen=%.4f rtd=%.4f(acc=%.1f%%) smooth=%.4f cluster=%.4f]"
+                "[gen=%.4f rtd=%.4f(acc=%.1f%%) cluster=%.4f ortho=%.4f]"
                 "  ppl %.1f  τ %.3f  masked/step %.0f"
                 "  lr %.2e  ‖g‖ %.3f%s"
                 "  %.1f stp/s  %.0f tok/s",
@@ -828,25 +792,25 @@ def train(
                 avg["loss"],
                 avg["loss_gen"],
                 avg["loss_rtd"], rtd_acc_sum / log_every * 100.0,
-                avg["loss_smooth"], avg["loss_cluster"],
+                avg["loss_cluster"], avg["loss_ortho"],
                 ppl, tau_val,
                 n_masked_acc / log_every,
                 lr_now, grad_norm, mem_str,
                 steps_per_sec, tok_per_sec,
             )
-            log.info("  prototypes : %s  entropy=%.1f%%", proto_str, entropy_pct)
-            log.info("  cosines    : %s", cos_str)
-            log.info("  switch mag : mean=%s  max=%s", sw_mean_str, sw_max_str)
+            log.info("  prototypes  : %s  entropy=%.1f%%", proto_str, entropy_pct)
+            log.info("  cosines     : %s", cos_str)
+            log.info("  EMA prior   : %s", prior_str)
+            log.info("  switch mag  : mean=%s  max=%s", sw_mean_str, sw_max_str)
 
-            # Snapshot for checkpoint metadata
             last_metrics = {
                 "step":              global_step,
                 "loss":              avg["loss"],
                 "loss_gen":          avg["loss_gen"],
                 "loss_rtd":          avg["loss_rtd"],
                 "rtd_acc":           rtd_acc_sum / log_every,
-                "loss_smooth":       avg["loss_smooth"],
                 "loss_cluster":      avg["loss_cluster"],
+                "loss_ortho":        avg["loss_ortho"],
                 "ppl":               ppl,
                 "tau":               tau_val,
                 "lr":                lr_now,
