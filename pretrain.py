@@ -523,6 +523,11 @@ def train(
         config.sinkhorn_iters,
         config.lambda_cluster,
     )
+    if config.prototype_prior is not None:
+        prior_str = "  ".join(f"p{i}={v:.3f}" for i, v in enumerate(config.prototype_prior))
+        log.info("Prototype prior (corpus-proportional): %s", prior_str)
+    else:
+        log.info("Prototype prior: uniform (1/K) — zero-knowledge mode")
 
     # ── Tokenizer ─────────────────────────────────────────────────────────
     tokenizer = SBERTaTokenizer.from_pretrained(tokenizer_dir)

@@ -79,6 +79,10 @@ def _geometric_span_mask(
     Completely independent of p⁽⁰⁾ — required for zero-knowledge pre-training
     where p⁽⁰⁾ carries no meaningful signal at the start of training.
 
+    All random number generation is performed in two bulk CPU calls before any
+    loop begins, eliminating per-iteration CUDA kernel launches that dominate
+    wall time when naively placing torch.rand / torch.randperm inside loops.
+
     Args:
         attention_mask: (B, T) binary — 1 for real tokens, 0 for padding
         mask_prob:      target fraction of real tokens to mask
@@ -89,70 +93,101 @@ def _geometric_span_mask(
         span_mask: (B, T) bool — True at positions selected for masking
     """
     B, T = attention_mask.shape
-    span_mask = torch.zeros(B, T, dtype=torch.bool, device=attention_mask.device)
+    device = attention_mask.device
     log1mp = math.log(1.0 - geo_p)  # precompute; geo_p is constant
 
+    # ── All randomness generated here, in two bulk CPU calls ──────────────
+    # real_lens: one batched sum + one device→CPU sync, not T individual syncs
+    real_lens = attention_mask.sum(dim=1).cpu()              # (B,)
+
+    # Pre-generate one random position permutation per batch item on CPU.
+    # torch.randperm on CPU + .tolist() is far cheaper than randperm on CUDA
+    # inside a Python loop (no kernel launch overhead, no sync).
+    perms = [torch.randperm(max(int(real_lens[b].item()), 1)) for b in range(B)]
+
+    # Pre-generate all span lengths at once via inverse CDF of Geometric(geo_p).
+    # One torch.rand(B, T) on CPU replaces T individual torch.rand(1) calls.
+    us       = torch.rand(B, T).clamp_(min=1e-9)             # (B, T) on CPU
+    raw_lens = us.log_().div_(log1mp).ceil_().clamp_(min_len, max_len).int()  # (B, T)
+
+    # ── Build mask on CPU — slice assignment has no kernel-launch overhead ─
+    span_mask = torch.zeros(B, T, dtype=torch.bool)          # CPU
+
     for b in range(B):
-        real_len = int(attention_mask[b].sum().item())
+        real_len = int(real_lens[b].item())
         if real_len == 0:
             continue
 
-        target_n = max(1, int(real_len * mask_prob))
-        n_masked = 0
+        target_n    = max(1, int(real_len * mask_prob))
+        n_masked    = 0
+        span_lens_b = raw_lens[b].tolist()
 
-        for start in torch.randperm(real_len, device=attention_mask.device).tolist():
+        for idx, start in enumerate(perms[b].tolist()):
             if n_masked >= target_n:
                 break
-            if span_mask[b, start]:
+            if start >= real_len or span_mask[b, start]:
                 continue
-
-            # Inverse CDF of Geometric(geo_p): span_len ~ Geom(geo_p)
-            u = max(torch.rand(1, device=attention_mask.device).item(), 1e-9)
-            raw_len = int(math.ceil(math.log(u) / log1mp))
-            span_len = max(min_len, min(raw_len, max_len))
-            # Clamp to remaining sequence and remaining budget
-            span_len = min(span_len, real_len - start, target_n - n_masked)
-
+            span_len = min(span_lens_b[idx], real_len - start, target_n - n_masked)
+            if span_len <= 0:
+                continue
             span_mask[b, start : start + span_len] = True
             n_masked += span_len
 
-    return span_mask                                 # (B, T)
+    # One H2D transfer for the whole batch at the end
+    return span_mask.to(device)                              # (B, T)
 
 
 @torch.no_grad()
-def _sinkhorn(scores: torch.Tensor, epsilon: float, n_iters: int) -> torch.Tensor:
+def _sinkhorn(
+    scores: torch.Tensor,
+    epsilon: float,
+    n_iters: int,
+    prototype_weights: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """
-    Sinkhorn-Knopp optimal transport for prototype equipartition.
+    Sinkhorn-Knopp optimal transport with support for non-uniform prototype marginals.
 
-    Produces a soft assignment matrix Q satisfying two constraints:
-      · Q.sum(dim=1) = 1        — each token has a valid probability distribution
-      · Q.sum(dim=0) ≈ N/K     — each prototype receives equal total mass
+    Produces a soft assignment matrix Q satisfying:
+      · Q.sum(dim=1) = 1                          — each token is fully assigned
+      · Q.sum(dim=0)[k] ≈ prototype_weights[k]    — each prototype receives its
+                                                     target share of total mass
 
-    The second constraint is the collapse-prevention guarantee: no prototype
-    can be starved of tokens, so prototypes are forced to find K distinct
-    clusters in the embedding space.
+    When prototype_weights is uniform (1/K), this reduces to the standard SwAV
+    equipartition. When set to corpus proportions (e.g. [0.87, 0.13]), it forces
+    the model to assign tokens in the true linguistic ratio, preventing Sinkhorn
+    from fighting the corpus distribution and causing collapse.
 
     Args:
-        scores:  (N, K) raw dot-product similarities (pre-softmax)
-        epsilon: entropy regularization strength — lower gives harder, more
-                 k-means-like assignments; 0.05 matches SwAV default
-        n_iters: Sinkhorn iterations; 3 is sufficient for convergence
+        scores:             (N, K) raw dot-product similarities (pre-softmax)
+        epsilon:            entropy regularization — lower → harder assignments
+        n_iters:            Sinkhorn iterations; 20 required for convergence at
+                            all input scales (3 is insufficient once tau sharpens)
+        prototype_weights:  (K,) target column marginals, must sum to 1.
+                            None → uniform 1/K (zero-knowledge mode)
     Returns:
-        Q: (N, K) soft assignment matrix
+        Q: (N, K) soft assignment — rows sum to 1, col k sums to N * weights[k]
     """
     N, K = scores.shape
-    # Row-wise shift for numerical stability before exponentiation
+
+    if prototype_weights is None:
+        prototype_weights = scores.new_ones(K) / K          # (K,) uniform
+
+    # Row-wise shift + clamp for numerical stability at any input scale.
+    # Clamp prevents exp(-large/epsilon) → 0 rows that break row normalization.
     shifted = scores - scores.max(dim=-1, keepdim=True).values
-    Q = torch.exp(shifted / epsilon)  # (N, K)
-    Q /= Q.sum()                       # global normalization: Q.sum() = 1
+    shifted = shifted.clamp(min=-10.0 / epsilon)
+    Q = torch.exp(shifted / epsilon)                         # (N, K)
+    Q /= Q.sum()                                             # global mass = 1
 
     for _ in range(n_iters):
-        # Prototype equipartition: column k should receive 1/K of total mass
-        Q /= Q.sum(dim=0, keepdim=True) * K
-        # Token normalization: row n should carry 1/N of total mass
-        Q /= Q.sum(dim=1, keepdim=True) * N
+        # Column: enforce prototype marginal — Q[:, k].sum() → prototype_weights[k]
+        col_sums = Q.sum(dim=0, keepdim=True).clamp(min=1e-8)        # (1, K)
+        Q = Q * (prototype_weights.unsqueeze(0) / col_sums)
+        # Row: enforce uniform token marginal — Q[n, :].sum() → 1/N
+        row_sums = Q.sum(dim=1, keepdim=True).clamp(min=1e-8)        # (N, 1)
+        Q = Q / (row_sums * N)
 
-    return Q * N  # rescale: rows now sum to 1, columns sum to N/K
+    return Q * N   # rows sum to 1, col k sums to N * prototype_weights[k]
 
 
 # ─── Language Prototypes ──────────────────────────────────────────────────────
@@ -609,9 +644,23 @@ class SBERTaForPreTraining(nn.Module):
         self.config: SBERTaConfig = config
         self.sberta: SBERTaModel = SBERTaModel(config)
         self.generator: SBERTaGenerator = SBERTaGenerator(config)
-
-        # Discriminator RTD head: binary real (0) vs replaced (1)
         self.rtd_head: nn.Linear = nn.Linear(config.hidden_size, 1)
+
+        # Prototype prior: corpus-proportional Sinkhorn marginals.
+        # Registered as a buffer so it lives on the correct device and is
+        # included in state_dict without being an optimised parameter.
+        if config.prototype_prior is not None:
+            prior = torch.tensor(config.prototype_prior, dtype=torch.float)
+            assert prior.shape[0] == config.num_languages, (
+                f"prototype_prior length ({prior.shape[0]}) must equal "
+                f"num_languages ({config.num_languages})"
+            )
+            assert abs(prior.sum().item() - 1.0) < 1e-5, (
+                f"prototype_prior must sum to 1.0, got {prior.sum().item():.6f}"
+            )
+            self.register_buffer("_prototype_prior", prior)
+        else:
+            self.register_buffer("_prototype_prior", None)
 
         self.apply(self._init_weights)
 
@@ -660,7 +709,12 @@ class SBERTaForPreTraining(nn.Module):
         real_h       = h_base[real]                                             # (N_real, d)
         proto_scores = real_h @ self.sberta.prototypes.prototypes.T \
                        / self.sberta.prototypes.tau                             # (N_real, K)
-        Q            = _sinkhorn(proto_scores.detach(), cfg.sinkhorn_epsilon, cfg.sinkhorn_iters)
+        Q            = _sinkhorn(
+            proto_scores.detach(),
+            cfg.sinkhorn_epsilon,
+            cfg.sinkhorn_iters,
+            prototype_weights=self._prototype_prior,   # None → uniform fallback
+        )
         loss_cluster = F.cross_entropy(proto_scores, Q)
 
         # ── Step 2: geometric span masking (language-agnostic) ────────────────

@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Optional
 
 
 @dataclass
@@ -23,8 +24,11 @@ class SBERTaConfig:
 
     # ── Code-switching ────────────────────────────────────────────────────
     num_languages: int = 2
-    proto_temperature: float = 1.0
-    learnable_temperature: bool = True
+    proto_temperature: float = 0.5   # fixed; learnable=False avoids tau decay
+                                     # sharpening Sinkhorn inputs past convergence
+    learnable_temperature: bool = False
+
+    prototype_prior: Optional[list] = field(default_factory=lambda: [0.90, 0.10])
 
     # ── Regularisation ────────────────────────────────────────────────────
     hidden_dropout_prob: float = 0.1
@@ -41,11 +45,11 @@ class SBERTaConfig:
     span_mask_max_len: int = 10
 
     # Sinkhorn-Knopp clustering (SwAV-style collapse prevention)
-    sinkhorn_epsilon: float = 0.05   # entropy regularization; lower → harder assignments
-    sinkhorn_iters: int = 3          # 3 iterations sufficient per SwAV paper
+    sinkhorn_epsilon: float = 0.1    # was 0.05; softer targets stable under sharp inputs
+    sinkhorn_iters: int = 20         # was 3; must converge at all input scales
 
     lambda_smooth: float = 5.0
-    lambda_cluster: float = 1.0      # weight for Sinkhorn clustering loss
+    lambda_cluster: float = 5.0     # was 1.0; must dominate early before RTD
 
     # ────────────────────────────────────────────────────────────────────
     def __post_init__(self) -> None:
