@@ -649,14 +649,11 @@ class SBERTaForPreTraining(nn.Module):
         self,
         input_ids: torch.Tensor,                         # (B, T)
         attention_mask: Optional[torch.Tensor] = None,   # (B, T) binary
-        segment_ids: Optional[torch.Tensor] = None,      # (B, T) document boundaries
     ) -> dict:
         """
         Args:
             input_ids:      (B, T) — original (unmasked) token ids.
             attention_mask: (B, T) — 1 for real tokens, 0 for padding.
-            segment_ids:    (B, T) — document segment IDs for packed sequences.
-                            If None, assumes single document per sequence.
         Returns:
             dict with scalar 'loss' and per-component loss values.
         """

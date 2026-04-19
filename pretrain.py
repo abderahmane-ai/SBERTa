@@ -117,8 +117,6 @@ class StreamingTextDataset(IterableDataset):
 
     def _iter_file(self, path: Path) -> Iterator[dict]:
         buffer_ids: List[int] = []
-        buffer_segs: List[int] = []
-        seg_id = 0
 
         with open(path, encoding="utf-8", errors="replace") as f_text:
             for raw in f_text:
@@ -135,20 +133,16 @@ class StreamingTextDataset(IterableDataset):
                     yield {
                         "input_ids":      torch.tensor(buffer_ids,  dtype=torch.long),
                         "attention_mask": torch.ones(T,              dtype=torch.long),
-                        "segment_ids":    torch.tensor(buffer_segs, dtype=torch.long),
                     }
-                    buffer_ids, buffer_segs = [], []
-                    seg_id += 1
+                    buffer_ids = []
 
                 buffer_ids.extend(sent_ids)
-                buffer_segs.extend([seg_id] * len(sent_ids))
 
         if buffer_ids:
             T = len(buffer_ids)
             yield {
                 "input_ids":      torch.tensor(buffer_ids,  dtype=torch.long),
                 "attention_mask": torch.ones(T,              dtype=torch.long),
-                "segment_ids":    torch.tensor(buffer_segs, dtype=torch.long),
             }
 
     def _get_worker_paths(self) -> List[Path]:
@@ -180,19 +174,15 @@ def collate_fn(batch: List[dict], pad_id: int) -> dict:
 
     input_ids      = torch.full((B, T), pad_id, dtype=torch.long)
     attention_mask = torch.zeros(B, T, dtype=torch.long)
-    segment_ids    = torch.zeros(B, T, dtype=torch.long)
 
     for i, item in enumerate(batch):
         n = item["input_ids"].size(0)
         input_ids[i, :n]      = item["input_ids"]
         attention_mask[i, :n] = item["attention_mask"]
-        if "segment_ids" in item:
-            segment_ids[i, :n] = item["segment_ids"]
 
     return {
         "input_ids":      input_ids,
         "attention_mask": attention_mask,
-        "segment_ids":    segment_ids,
     }
 
 
@@ -544,16 +534,11 @@ def train(
 
             input_ids      = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-            segment_ids    = (
-                batch["segment_ids"].to(device, non_blocking=True)
-                if "segment_ids" in batch else None
-            )
 
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 out = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    segment_ids=segment_ids,
                 )
                 loss_scaled = out["loss"] / grad_accum
 
