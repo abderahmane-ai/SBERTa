@@ -37,7 +37,9 @@ class SBERTaConfig:
     n_base_layers: int = 6
 
     # ── Code-switching ────────────────────────────────────────────────────
-    num_languages: int = 2
+    num_languages: int = 2  # K=2 for first run on ELNER-DZ (~15-25M tokens)
+                            # Arabic script vs Arabizi/Latin is the dominant split
+                            # K=3 (adding French) requires 100M+ tokens for stability
     proto_temperature: float = 0.5   # stored as log_τ; learnable=False avoids
                                      # tau decay that sharpens Sinkhorn past
                                      # convergence
@@ -48,7 +50,8 @@ class SBERTaConfig:
     # Sinkhorn batch marginals. Converges to the true corpus language
     # distribution within ~500 optimiser steps without any hardcoded signal.
     # Works on any K-language mixture at any corpus proportion.
-    prior_ema_momentum: float = 0.99
+    prior_ema_momentum: float = 0.95  # faster adaptation for small corpus (<50M tokens)
+                                      # use 0.99 for large corpus (>100M tokens)
 
     # ── Regularisation ────────────────────────────────────────────────────
     hidden_dropout_prob: float = 0.1
