@@ -804,22 +804,4 @@ class SBERTaForPreTraining(nn.Module):
 
     def get_encoder(self) -> SBERTaModel:
         """Return the bare encoder for downstream fine-tuning."""
-        return self.sberta)
-            nn.init.normal_(module.W_O.weight, mean=0.0, std=0.02)
-            nn.init.zeros_(module.W_O.bias)
-            return
-        if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, nn.LayerNorm):
-            nn.init.ones_(module.weight)
-            nn.init.zeros_(module.bias)
-
-    def get_encoder(self) -> SBERTaModel:
-        """Return the bare encoder for downstream fine-tuning."""
         return self.sberta
