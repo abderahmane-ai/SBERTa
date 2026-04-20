@@ -37,7 +37,7 @@ class SBERTaConfig:
     n_base_layers: int = 6
 
     # ── Code-switching ────────────────────────────────────────────────────
-    num_languages: int = 2  # K=2 for first run on ELNER-DZ (~15-25M tokens)
+    num_languages: int = 3  # K=2 for first run on ELNER-DZ (~15-25M tokens)
                             # Arabic script vs Arabizi/Latin is the dominant split
                             # K=3 (adding French) requires 100M+ tokens for stability
     proto_temperature: float = 0.5   # stored as log_τ; learnable=False avoids
