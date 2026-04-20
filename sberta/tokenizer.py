@@ -59,6 +59,17 @@ _ARABIC_INDIC: Dict[int, int] = str.maketrans("٠١٢٣٤٥٦٧٨٩", "012345678
 # Non-Arabic uppercase (ASCII only) — for efficient lowercasing
 _NON_ARABIC_UPPER: re.Pattern = re.compile(r'[A-Z]')
 
+# French accents (folded to base Latin characters)
+_FRENCH_ACCENTS: Dict[int, int] = str.maketrans(
+    "éèêëàâäôöûüçîïÉÈÊËÀÂÄÔÖÛÜÇÎÏ",
+    "eeeeaaaoouuciiEEEEAAAOOUUCII"
+)
+
+# Arabic orthographic variants
+_ALEF: re.Pattern = re.compile(r"[أإآ]")
+# Character elongation (e.g. haaaaaay)
+_ELONGATION: re.Pattern = re.compile(r"(.)\1{2,}")
+
 # Arabic Unicode block (U+0600–U+06FF) — used to preserve case of Arabic chars
 _ARABIC_BLOCK_LO: int = 0x0600
 _ARABIC_BLOCK_HI: int = 0x06FF
@@ -76,11 +87,15 @@ def normalise(text: str) -> str:
       3. Remove tatweel — purely decorative; 'كييييف' and 'كيف' are the same word.
       4. Arabic-Indic digits → ASCII — prevents the same Arabizi digit (e.g. 3)
          from appearing as two token types depending on the user's keyboard.
-      5. Lowercase non-Arabic uppercase — halves the effective Latin alphabet
+      5. Fold French accents — standardises Arabizi/French loanwords.
+      6. Lowercase non-Arabic uppercase — halves the effective Latin alphabet
          and handles inconsistent social-media casing. Arabic has no case.
-      6. Collapse whitespace.
+      7. Fold Arabic orthographic variants (Alef, Teh Marbuta, Alef Maksura) —
+         standardises dialectal spelling.
+      8. Cap character elongations at 2 (e.g. haaaaaay → haay).
+      9. Collapse whitespace.
 
-    Arabizi digit-letters (2 ء, 3 ع, 5 خ, 6 ط, 7 ح, 9 ق) survive steps 1–6
+    Arabizi digit-letters (2 ء, 3 ع, 5 خ, 6 ط, 7 ح, 9 ق) survive steps 1–9
     unchanged. The SP model trained on Darija data learns them as part of
     coherent lexical units (3ndek, 7atta, m9abel, …).
 
@@ -93,8 +108,21 @@ def normalise(text: str) -> str:
     text = _HARAKAT.sub("", text)
     text = _TATWEEL.sub("", text)
     text = text.translate(_ARABIC_INDIC)
+    
+    # French accent folding
+    text = text.translate(_FRENCH_ACCENTS)
+    
     # Lowercase only ASCII uppercase (Arabic has no case) - vectorized with regex
     text = _NON_ARABIC_UPPER.sub(lambda m: m.group(0).lower(), text)
+    
+    # Fold Arabic orthographic variants (standardization for dialects)
+    text = _ALEF.sub("ا", text)       # Alef variants -> bare Alef
+    text = text.replace("ة", "ه")     # Teh Marbuta -> Heh
+    text = text.replace("ى", "ي")     # Alef Maksura -> Yaa
+    
+    # Cap character elongations at 2 (e.g. haaaaaay -> haay)
+    text = _ELONGATION.sub(r"\1\1", text)
+    
     text = " ".join(text.split())
     return text
 

@@ -60,6 +60,7 @@ import io
 import logging
 import os
 import tempfile
+import re
 from pathlib import Path
 from typing import Iterator, List, Optional
 
@@ -81,19 +82,28 @@ log: logging.Logger = logging.getLogger(__name__)
 def iter_lines(paths: List[Path], min_chars: int = 5) -> Iterator[str]:
     """
     Stream normalised lines from a list of text files.
+    
+    Includes principled upsampling of Arabic script lines to prevent Unigram 
+    from starving the Arabic vocabulary in Arabizi-dominated corpora.
 
     Args:
         paths:     list of plain-text corpus files (UTF-8, one sentence per line).
         min_chars: skip lines shorter than this after normalisation.
     Yields:
-        Normalised non-empty lines.
+        Normalised non-empty lines (with Arabic-heavy lines yielded 3x).
     """
+    arabic_pattern = re.compile(r"[\u0600-\u06FF]")
+    
     for path in paths:
         with open(path, encoding="utf-8", errors="replace") as fh:
             for raw in fh:
                 line: str = normalise(raw.strip())
                 if len(line) >= min_chars:
                     yield line
+                    # Upsample if line is >30% Arabic script
+                    if len(arabic_pattern.findall(line)) > len(line) * 0.3:
+                        yield line
+                        yield line
 
 
 def write_normalised_corpus(

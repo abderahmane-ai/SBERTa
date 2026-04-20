@@ -124,6 +124,8 @@ class StreamingTextDataset(IterableDataset):
                     raw.strip(),
                     add_sep=True,
                     max_length=self.max_length,
+                    sample=True,
+                    sample_alpha=0.1,
                 )
                 if not sent_ids:
                     continue

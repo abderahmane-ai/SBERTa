@@ -415,7 +415,7 @@ class SBERTaLayer(nn.Module):
 
 
 class _GeneratorLayer(nn.Module):
-    """Standard post-LN transformer layer used internally by SBERTaGenerator."""
+    """Standard Pre-LN transformer layer used internally by SBERTaGenerator."""
 
     def __init__(
         self, d: int, n_heads: int, ffn_dim: int, dropout: float, eps: float
@@ -787,6 +787,24 @@ class SBERTaForPreTraining(nn.Module):
             nn.init.normal_(module.W_Q.weight, mean=0.0, std=0.02)
             nn.init.normal_(module.W_K.weight, mean=0.0, std=0.02)
             nn.init.normal_(module.W_V.weight, mean=0.0, std=0.02)
+            nn.init.normal_(module.W_O.weight, mean=0.0, std=0.02)
+            nn.init.zeros_(module.W_O.bias)
+            return
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
+
+    def get_encoder(self) -> SBERTaModel:
+        """Return the bare encoder for downstream fine-tuning."""
+        return self.sberta)
             nn.init.normal_(module.W_O.weight, mean=0.0, std=0.02)
             nn.init.zeros_(module.W_O.bias)
             return
