@@ -95,7 +95,7 @@ class SBERTaConfig:
     # ── Convenience factories ────────────────────────────────────────────
     @classmethod
     def small(cls) -> "SBERTaConfig":
-        """Quick-experiment config (~16 M params)."""
+        """Quick-experiment config (~17 M params)."""
         return cls(
             hidden_size=256,
             num_hidden_layers=4,
@@ -106,12 +106,12 @@ class SBERTaConfig:
 
     @classmethod
     def base(cls) -> "SBERTaConfig":
-        """BERT-base equivalent size (~124 M params)."""
+        """BERT-base equivalent size (~136 M params)."""
         return cls()            # all defaults; n_base_layers=6 of 12
 
     @classmethod
     def medium(cls) -> "SBERTaConfig":
-        """Mid-range config suitable for low-resource experiments (~51 M params)."""
+        """Mid-range config suitable for low-resource experiments (~55 M params)."""
         return cls(
             hidden_size=512,
             num_hidden_layers=8,
@@ -122,7 +122,7 @@ class SBERTaConfig:
 
     @classmethod
     def large(cls) -> "SBERTaConfig":
-        """BERT-large equivalent size (requires massive data, ~355 M params)."""
+        """BERT-large equivalent size (requires massive data, ~394 M params)."""
         return cls(
             hidden_size=1024,
             num_hidden_layers=24,

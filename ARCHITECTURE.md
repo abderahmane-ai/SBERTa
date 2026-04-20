@@ -168,9 +168,9 @@ A scalar bias per head is symmetric and limited in expressiveness. A matrix $\ma
 
 | Config | $d$ | $L$ ($n_{\text{base}}$) | $H$ | FFN | $K$ | Params |
 |--------|-----|-----|-----|-----|-----|--------|
-| Small  | 256 | 4 (2) | 4   | 1024  | 2 | ~16M  |
-| Medium | 512 | 8 (4) | 8   | 2048  | 2 | ~51M  |
-| Base   | 768 | 12 (6)| 12  | 3072  | 2 | ~124M |
-| Large  | 1024| 24 (12)| 16  | 4096  | 2 | ~355M |
+| Small  | 256 | 4 (2) | 4   | 1024  | 2 | ~17M  |
+| Medium | 512 | 8 (4) | 8   | 2048  | 2 | ~55M  |
+| Base   | 768 | 12 (6)| 12  | 3072  | 2 | ~136M |
+| Large  | 1024| 24 (12)| 16  | 4096  | 2 | ~394M |
 
 $K = 2$ is optimal for bilingual mixtures. The architecture natively supports arbitrary $K$ for multi-lingual code-switching by simply changing the config.
