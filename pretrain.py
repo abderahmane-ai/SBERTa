@@ -461,8 +461,10 @@ def train(
             param.ndim == 1
             or name.endswith(".bias")
             or "prototypes.prototypes" in name
-            or "log_tau" in name
+            or "rho" in name
             or ".compat" in name
+            or ".beta" in name
+            or ".gamma" in name
         ):
             no_decay_params.append(param)
         else:

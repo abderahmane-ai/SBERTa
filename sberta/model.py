@@ -208,16 +208,19 @@ class LanguagePrototypes(nn.Module):
             nn.init.orthogonal_(self.prototypes)
             self.prototypes.mul_(0.5)
 
-        log_tau_init = math.log(config.proto_temperature)
+        tau_init = config.proto_temperature
+        tau_min = 0.25
+        rho_init = math.log(math.exp(tau_init - tau_min) - 1.0)
+        
         if config.learnable_temperature:
-            self.log_tau: nn.Parameter = nn.Parameter(torch.tensor(log_tau_init))
+            self.rho: nn.Parameter = nn.Parameter(torch.tensor(rho_init))
         else:
-            self.register_buffer("log_tau", torch.tensor(log_tau_init))
+            self.register_buffer("rho", torch.tensor(rho_init))
 
     @property
     def tau(self) -> torch.Tensor:
-        """Always-positive temperature: τ = exp(log_τ), floored at 0.25."""
-        return self.log_tau.exp().clamp(min=0.25)
+        """Always-positive temperature: τ = 0.25 + softplus(ρ)."""
+        return 0.25 + F.softplus(self.rho)
 
     def get_distributions(self, h: torch.Tensor) -> torch.Tensor:
         """
@@ -323,12 +326,10 @@ class SBERTaAttention(nn.Module):
 
         if use_lang_bias:
             # Per-head K×K language compatibility matrix Cₕ ∈ ℝ^{H×K×K}
-            self.compat: nn.Parameter = nn.Parameter(
-                torch.eye(K).unsqueeze(0).expand(H, -1, -1).clone()
-                + 0.01 * torch.randn(H, K, K)
-            )
-            # Global switch-position scalar γ, init to zero
-            self.gamma: nn.Parameter = nn.Parameter(torch.zeros(1))
+            self.compat: nn.Parameter = nn.Parameter(torch.zeros(H, K, K))
+            # Per-head structural scalars
+            self.beta: nn.Parameter = nn.Parameter(torch.full((H, 1, 1), 0.01))
+            self.gamma: nn.Parameter = nn.Parameter(torch.full((H, 1, 1), 0.01))
 
     def _split(self, x: torch.Tensor) -> torch.Tensor:
         B, T, _ = x.shape
@@ -351,12 +352,28 @@ class SBERTaAttention(nn.Module):
         K_ = self._split(self.W_K(H))
         V  = self._split(self.W_V(H))
 
+        # ── Fast Path (Phase 1) ───────────────────────────────────────────
+        # Uses PyTorch 2.0+ Scaled Dot Product Attention (FlashAttention)
+        if not self.use_lang_bias:
+            dropout_p = self.attn_drop.p if self.training else 0.0
+            out = F.scaled_dot_product_attention(
+                Q, K_, V,
+                attn_mask=additive_mask,
+                dropout_p=dropout_p,
+            )
+            return self.W_O(self._merge(out))
+
+        # ── Slow Path (Phase 2) ───────────────────────────────────────────
+        # Materializes the full N² attention matrix to add the language bias
         scores = torch.matmul(Q, K_.transpose(-2, -1)) / self.scale  # (B, H, T, T)
 
-        if self.use_lang_bias and p is not None and s is not None:
+        if self.use_lang_bias and p is not None:
             p_compat = torch.einsum("bik,hkl->bhil", p, self.compat)      # (B, H, T, K)
-            scores   = scores + torch.einsum("bhil,bjl->bhij", p_compat, p)
-            scores   = scores + self.gamma * s.view(B, 1, 1, T)
+            sem_bias = torch.einsum("bhil,bjl->bhij", p_compat, p)        # (B, H, T, T)
+            # Pairwise language divergence: δ_ij = 1 - p_iᵀ p_j
+            delta_ij = 1.0 - torch.matmul(p, p.transpose(-1, -2)).unsqueeze(1) # (B, 1, T, T)
+            
+            scores = scores + self.beta * sem_bias + self.gamma * delta_ij
 
         if additive_mask is not None:
             scores = scores + additive_mask
