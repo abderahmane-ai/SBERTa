@@ -19,7 +19,7 @@ Two-phase encoder:
     clustering and prototype orthogonality are enforced here.
 
   Phase 2 — Language-Aware (layers n_base_layers … num_hidden_layers−1):
-    S_h(i,j) = (Qᵢ·Kⱼ)/√dₕ + pᵢᵀ Cₕ pⱼ + γ·sⱼ
+    S_h(i,j) = (Qᵢ·Kⱼ)/√dₕ + β · pᵢᵀ Cₕ pⱼ + γ · δ_ij
     K×K compatibility matrices receive a real signal and learn asymmetric
     cross-language attention affinities. Temporal coherence across language
     spans emerges implicitly — no smoothing penalty required.
@@ -224,7 +224,9 @@ class LanguagePrototypes(nn.Module):
 
     def get_distributions(self, h: torch.Tensor) -> torch.Tensor:
         """
-        p_t = softmax(h_t Lᵀ / τ)
+        p_t = softmax(h_t L_normᵀ / τ)
+        (where L_norm is L L2-normalized along the hidden dimension, making
+        p depend on cosine similarity rather than raw magnitude).
 
         Args:
             h: (B, T, d) — Phase 1 contextual representations
@@ -301,11 +303,11 @@ class SBERTaAttention(nn.Module):
     compat / gamma parameters are not created.
 
     Phase 2 score:
-      S_h(i,j) = (Qᵢ · Kⱼ) / √dₕ  +  pᵢᵀ Cₕ pⱼ  +  γ · sⱼ
+      S_h(i,j) = (Qᵢ · Kⱼ) / √dₕ  +  β · pᵢᵀ Cₕ pⱼ  +  γ · δ_ij
 
-    Cₕ ∈ ℝ^{K×K} per head, initialised to identity (starts from standard
+    Cₕ ∈ ℝ^{K×K} per head, initialised to zero (starts from standard
     attention; learns asymmetric language affinities as training progresses).
-    γ initialised to zero.
+    β and γ initialised to 0.01.
     """
 
     def __init__(self, config: SBERTaConfig, use_lang_bias: bool = True) -> None:
@@ -387,7 +389,7 @@ class SBERTaAttention(nn.Module):
 
 class SBERTaLayer(nn.Module):
     """
-    One SBERTa encoder layer (post-LN).
+    One SBERTa encoder layer (Pre-LN).
 
     When use_lang_bias=False (Phase 1): standard BERT-style transformer layer.
     When use_lang_bias=True  (Phase 2): language-aware layer with K×K compat bias.
@@ -795,8 +797,9 @@ class SBERTaForPreTraining(nn.Module):
         LanguagePrototypes and SBERTaAttention (Phase 2) are skipped because
         they set their own initialisations in __init__:
           · LanguagePrototypes.prototypes — orthogonal init scaled by 0.5
-          · SBERTaAttention.compat        — identity init
-          · SBERTaAttention.gamma         — zero init
+          · SBERTaAttention.compat        — zero init
+          · SBERTaAttention.beta          — 0.01 init
+          · SBERTaAttention.gamma         — 0.01 init
         """
         if isinstance(module, LanguagePrototypes):
             return

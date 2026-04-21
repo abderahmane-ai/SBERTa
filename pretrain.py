@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from functools import partial
 import logging
 import math
 import os
@@ -432,7 +433,7 @@ def train(
         batch_size=batch_size,
         num_workers=num_workers,
         pin_memory=(device.type == "cuda"),
-        collate_fn=lambda b: collate_fn(b, pad_id=tokenizer.PAD_ID),
+        collate_fn=partial(collate_fn, pad_id=tokenizer.PAD_ID),
         prefetch_factor=4 if num_workers > 0 else None,
         persistent_workers=(num_workers > 0),
     )
@@ -751,7 +752,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--runs-dir",         type=str,   default="runs")
     p.add_argument("--checkpoint-every", type=int,   default=5_000)
     p.add_argument("--log-every",        type=int,   default=100)
-    p.add_argument("--num-workers",      type=int,   default=0)
+    p.add_argument("--num-workers",      type=int,   default=16)
     return p.parse_args()
 
 
