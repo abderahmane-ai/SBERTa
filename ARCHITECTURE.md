@@ -9,7 +9,7 @@
 SBERTa treats code-switching as a structural signal rather than noise. It makes two linguistic phenomena explicit architectural components:
 
 1. **Language identity** — soft distributions over $K$ language prototypes.
-2. **Language boundaries** — continuous switch magnitudes between consecutive tokens.
+2. **Language boundaries** — continuous pairwise divergence between token representations.
 
 The model is **fully zero-knowledge**. It uses no Unicode priors, script IDs, or dictionaries. Language structure emerges purely from the Masked Language Modeling (MLM) distributional objective, stabilized by a Sinkhorn-Knopp clustering loss. This makes SBERTa a universal standard applicable to any K-language mixture (multi-script like Darija, or mono-script like Spanglish/Hinglish).
 
@@ -19,9 +19,9 @@ The model is **fully zero-knowledge**. It uses no Unicode priors, script IDs, or
 
 SBERTa avoids the "bootstrap paradox" of assigning language probabilities to noisy, raw token embeddings. Instead, it employs a two-phase design:
 
-1. **Phase 1 — Context (layers $0 \dots n_{\text{base}}-1$):** Standard self-attention layers with no language bias injected. MLM distributional pressure forces contextualized, semantically rich representations ($\mathbf{h}_{\text{base}}$) to emerge naturally.
-2. **Language Assignment Pivot:** Language distributions ($p$) and switch magnitudes ($s$) are computed from $\mathbf{h}_{\text{base}}$ at the boundary between phases. Because they are based on context, they are meaningful from the start.
-3. **Phase 2 — Language-Aware (layers $n_{\text{base}} \dots L-1$):** Language signals are routed into the attention mechanism via compatibility matrices, guiding the rest of the network.
+1. **Phase 1 — Context (layers $0 \dots n_{\text{base}}-1$):** Standard self-attention layers with no language bias injected. Uses Pre-LayerNorm (Pre-LN) and PyTorch's Scaled Dot Product Attention (FlashAttention) fast-path. MLM distributional pressure forces contextualized, semantically rich representations ($\mathbf{h}_{\text{base}}$) to emerge naturally.
+2. **Language Assignment Pivot:** Language distributions ($\mathbf{p}$) and pairwise divergences ($\boldsymbol{\Delta}$) are computed from $\mathbf{h}_{\text{base}}$ at the boundary between phases. Because they are based on context, they are meaningful from the start.
+3. **Phase 2 — Language-Aware (layers $n_{\text{base}} \dots L-1$):** Language signals are routed into the attention mechanism via learned compatibility structures, guiding the rest of the network.
 
 ---
 
@@ -29,7 +29,7 @@ SBERTa avoids the "bootstrap paradox" of assigning language probabilities to noi
 
 ### 3.1 Prototype Vectors
 
-The model learns $K$ prototype vectors $\mathbf{L} = [\boldsymbol{\ell}_1, \ldots, \boldsymbol{\ell}_K] \in \mathbb{R}^{K \times d}$ representing language directions in the embedding space.
+The model learns $K$ prototype vectors $\mathbf{L} = [\boldsymbol{\ell}_1, \ldots, \boldsymbol{\ell}_K]^\top \in \mathbb{R}^{K \times d}$ representing language directions in the embedding space.
 
 **Initialization:** Orthogonal initialization scaled by 0.5 to avoid softmax saturation:
 $$\mathbf{L} \sim \text{Orthogonal}(\mathbb{R}^{K \times d}), \quad \mathbf{L} \leftarrow 0.5 \cdot \mathbf{L}$$
@@ -38,10 +38,14 @@ $$\mathbf{L} \sim \text{Orthogonal}(\mathbb{R}^{K \times d}), \quad \mathbf{L} \
 
 For each token $t$, the distribution is computed from the output of Phase 1, $\mathbf{h}_{\text{base},t}$:
 
-$$p_t = \text{softmax}\left(\frac{\mathbf{h}_{\text{base},t} \mathbf{L}^\top}{\tau}\right) \in \Delta^K$$
+$$\mathbf{p}_t = \text{softmax}\left(\frac{\mathbf{L}_{\text{norm}} \mathbf{h}_{\text{base},t}^\top}{\tau}\right) \in \Delta^K$$
 
-where $\tau$ is a learnable temperature parameter stored as $\log \tau$:
-$$\tau = \exp(\log \tau), \quad \log \tau \in \mathbb{R}, \quad \tau \geq 0.25$$
+(where $\mathbf{L}_{\text{norm}}$ is $\mathbf{L}$ L2-normalized along the hidden dimension, making $p$ depend on cosine similarity rather than raw magnitude).
+
+$\tau$ is a precision parameter with a numerical stability floor, parameterized smoothly via softplus:
+$$\tau = \tau_{\min} + \text{softplus}(\rho), \quad \rho \in \mathbb{R}, \quad \tau_{\min} = 0.25$$
+
+This guarantees $\tau \geq 0.25$ without gradient discontinuity, preventing division-by-zero instability while allowing the model to learn arbitrarily soft assignments during early training.
 
 ### 3.3 Sinkhorn-Knopp with Adaptive EMA Prior ($\mathcal{L}_{\text{cluster}}$)
 
@@ -51,37 +55,46 @@ Instead of forcing a rigid $1/K$ uniform split, it uses an **Adaptive EMA prior*
 1. Every token has a valid probability distribution (rows sum to 1).
 2. Every prototype receives a share of the batch's total mass proportional to the learned EMA prior.
 
+The algorithm converges in 3–5 iterations and operates on batch-level statistics, adding negligible overhead.
+
 A Cross-Entropy loss forces the model's distributions to match these balanced targets:
-$$\mathcal{L}_{\text{cluster}} = \text{CrossEntropy}(p, \mathbf{Q})$$
+$$\mathcal{L}_{\text{cluster}} = \text{CrossEntropy}(\mathbf{p}, \mathbf{Q})$$
 
-### 3.4 Orthogonality Regularization ($\mathcal{L}_{\text{ortho}}$)
+### 3.4 Pairwise Language Divergence
 
-Directly regularizes prototype geometry by penalizing off-diagonal entries of the Gram matrix of normalized prototypes, preventing vectors from drifting together regardless of assignment dynamics:
-$$\mathcal{L}_{\text{ortho}} = (\mathbf{L}_n \mathbf{L}_n^\top - \mathbf{I})^2.\text{mean}()$$
-
-### 3.5 Switch Magnitudes
-
-Continuous measure of language change between consecutive tokens:
-
-$$s_t = 1 - p_t^\top p_{t-1}, \quad s_1 = 0$$
+The fundamental structural measure is the pairwise divergence between any two positions:
+$$\delta_{ij} = 1 - \mathbf{p}_i^\top \mathbf{p}_j \in [0, 1]$$
 
 **Interpretation:**
-- $s_t \approx 0$: Same language as previous token.
-- $s_t \approx 1$: Complete language switch.
-- $s_t \in (0, 1)$: Partial or gradual transition (ambiguous tokens, punctuation).
+- $\delta_{ij} \approx 0$: Positions $i$ and $j$ share the same language distribution.
+- $\delta_{ij} \approx 1$: Maximally distinct language states.
+- $\delta_{ij} \in (0,1)$: Partial overlap (mixed tokens, transition zones, borrowings).
+
+The sequential switch magnitude is the natural restriction to consecutive tokens ($s_t = \delta_{t,t-1}$). This requires no extra parameters and generalizes the concept of a language boundary from a local sequence property to a pairwise structural relationship.
+
+### 3.5 Orthogonality Regularization ($\mathcal{L}_{\text{ortho}}$)
+
+While Sinkhorn-Knopp dynamically prevents prototype collapse via transport constraints, an explicit geometric prior on prototype directions accelerates early training and guards against pathological initializations. Let $\mathbf{L}_n$ denote row-normalized prototypes. The regularization penalizes off-diagonal correlation in their Gram matrix:
+$$\mathcal{L}_{\text{ortho}} = \frac{1}{K^2}\left|\mathbf{L}_n \mathbf{L}_n^\top - \mathbf{I}\right|_F^2$$
+
+This is a soft constraint; the transport loss remains the primary diversity mechanism, while $\mathcal{L}_{\text{ortho}}$ ensures prototypes maintain geometric separation independent of batch assignment dynamics.
 
 ---
 
 ## 4. Language-Aware Attention (Phase 2)
 
-In Phase 2 layers, SBERTa applies standard transformer attention with two additive language-aware biases:
+In Phase 2 layers, standard transformer attention is augmented with a structural prior that interacts with semantic similarity through learned per-head scaling. All language-specific parameters are initialized to zero, meaning every head begins as a standard transformer and discovers language structure organically during training.
 
-$$\text{score}_h(i, j) = \frac{\mathbf{Q}_{h,i} \mathbf{K}_{h,j}^\top}{\sqrt{d_h}} + p_i^\top \mathbf{C}_h \, p_j + \gamma \, s_j$$
+The attention score for head $h$ is:
+$$\text{score}_h(i, j) = \frac{\mathbf{Q}_{h,i} \mathbf{K}_{h,j}^\top}{\sqrt{d_h}} + \beta_h \cdot \mathbf{p}_i^\top \mathbf{C}_h \mathbf{p}_j + \gamma_h \cdot \delta_{ij}$$
 
 where:
 - $h \in \{1, \ldots, H\}$ indexes attention heads.
-- $\mathbf{C}_h \in \mathbb{R}^{K \times K}$ is a per-head asymmetric language compatibility matrix.
-- $\gamma \in \mathbb{R}$ is a global switch-position bias shared across all heads.
+- $\mathbf{C}_h \in \mathbb{R}^{K \times K}$ is a per-head asymmetric language compatibility matrix, initialized to $\mathbf{0}$.
+- $\beta_h, \gamma_h \in \mathbb{R}$ are per-head learnable scalars, initialized to $0.01$. They allow each head to discover how much structural information to incorporate; some heads may specialize in pure semantics while others become cross-lingual routers.
+- $\delta_{ij} = 1 - \mathbf{p}_i^\top \mathbf{p}_j$ is the pairwise language divergence.
+
+The per-head scalars ensure that the language terms are on a comparable scale with the semantic term. The divergence $\delta_{ij}$ is inherently query-dependent, allowing the model to learn that an Arabic query attending to a Latin key should receive a different structural bias than a Latin query attending to an Arabic key. Because $\mathbf{C}_h$ and the scalars start at zero, the model initially trains as a vanilla transformer; language-aware routing emerges only where the data justifies it.
 
 ---
 
@@ -98,18 +111,20 @@ where:
 - Full two-phase architecture
 - Binary classification head: $\mathbb{R}^d \to \mathbb{R}$
 
+The generator is smaller to ensure it produces plausible but detectable errors. Because the token embedding table is shared at full dimension $d$, the generator receives high-quality input representations despite its reduced capacity.
+
 ### 5.2 Gradient-Disentangled Embedding Sharing (GDES)
 
 To solve the notorious instability of ELECTRA models, SBERTa implements DeBERTaV3's **GDES**.
 
-The generator and discriminator share the token embedding table, but **gradients from the discriminator's RTD loss do not flow into it**. Only the generator's MLM loss updates the shared embeddings.
+The generator and discriminator share the token embedding table, but gradients from the discriminator's RTD loss do not flow into it. Only the generator's MLM loss updates the shared embeddings.
 This prevents the "gradient tug-of-war" where the discriminator tries to push similar embeddings apart to detect fakes. The generator builds clean semantic clusters, and the discriminator detaches its embedding lookup (`stop_embedding_grad=True`), ensuring the Sinkhorn algorithm clusters true semantic representations.
 
 ### 5.3 Geometric Span Masking
 
 Instead of standard random token masking, SBERTa masks geometric spans.
-Span lengths are sampled from a Geometric distribution $\text{Geom}(p)$ with a mean length of $1/p$ tokens. 
-Crucially, this masking is language-agnostic and completely independent of $p$. This allows the generator to focus purely on reconstructing context without relying on language predictions.
+Span lengths are sampled from a Geometric distribution $\text{Geom}(p)$ with a mean length of $1/p$ tokens.
+Crucially, this masking is language-agnostic and completely independent of $\mathbf{p}$. This allows the generator to focus purely on reconstructing context without relying on language predictions.
 
 ---
 
@@ -139,9 +154,10 @@ $$\mathcal{L} = \mathcal{L}_{\text{gen}} + w_{\text{rtd}} \cdot \mathcal{L}_{\te
 
 ## 7. Sentence-Level Representations
 
-SBERTa does not use a [CLS] token. For sentence-level tasks, use **mean pooling**:
-$$\mathbf{z} = \frac{1}{|\mathcal{R}|} \sum_{t \in \mathcal{R}} \mathbf{h}_t^{(L)}$$
-This is because code-switching is a per-token property, and mean pooling treats all languages democratically across the sequence.
+SBERTa does not use a [CLS] token. For sentence-level tasks, mean pooling over real tokens provides the semantic centroid:
+$$\mathbf{z}_{\text{sem}} = \frac{1}{|\mathcal{R}|} \sum_{t \in \mathcal{R}} \mathbf{h}_t^{(L)}$$
+
+Because code-switching structure is often discriminative, the language trajectory $\{\mathbf{p}_t\}_{t \in \mathcal{R}}$ and derived boundary sequence $\{s_t\}$ provide a complementary structural signature. For tasks requiring explicit switch-awareness, representations can be augmented with a pooled summary of the language trajectory. By default, mean pooling treats all languages democratically while the Phase-2 hidden states retain full language-aware context.
 
 ---
 
@@ -151,7 +167,7 @@ This is because code-switching is a per-token property, and mean pooling treats 
 Deriving language distributions from raw embeddings is noisy and unreliable (the "bootstrap paradox"). Phase 1 builds rich, language-agnostic contextual representations first. When the language pivot happens, it has semantic context, meaning prototypes accurately cluster concepts rather than arbitrary surface features.
 
 ### 8.2 Why Sinkhorn-Knopp with Adaptive EMA Prior?
-In purely unsupervised setups, models easily suffer from "prototype collapse". Sinkhorn mathematically guarantees balanced assignments. By using an Adaptive EMA prior rather than a uniform split ($1/K$), the model discovers the true natural frequency of the corpus's languages instead of fighting against it.
+In purely unsupervised setups, models easily suffer from "prototype collapse". Sinkhorn mathematically guarantees balanced assignments. By using an Adaptive EMA prior rather than a uniform split (1/K), the model discovers the true natural frequency of the corpus's languages instead of fighting against it.
 
 ### 8.3 Why GDES (Gradient-Disentangled Embedding Sharing)?
 ELECTRA models suffer from a "gradient tug-of-war": the generator tries to make embeddings semantically rich, while the discriminator rips them apart to detect fakes. By preventing the RTD loss from updating the token embeddings, the embeddings remain semantically pure, which is an absolute necessity for unsupervised language clustering to work.
@@ -159,8 +175,17 @@ ELECTRA models suffer from a "gradient tug-of-war": the generator tries to make 
 ### 8.4 Why Geometric Span Masking?
 Unlike masking that relies on early noisy predictions, geometric masking is language-agnostic. It forces the generator to reconstruct contiguous blocks of text without needing hints from the discriminator.
 
-### 8.5 Why Per-Head Compatibility Matrices?
-A scalar bias per head is symmetric and limited in expressiveness. A matrix $\mathbf{C}_h \in \mathbb{R}^{K \times K}$ per head is asymmetric, allowing the model to learn that an Arabic query attending to a Latin key should receive a different bias than a Latin query attending to an Arabic key. The cost is only $K^2 H$ additional parameters.
+### 8.5 Why Zero-Initialized Language Parameters?
+All per-head compatibility matrices $\mathbf{C}_h$ and structural scalars $\beta_h, \gamma_h$ are initialized to zero (or near-zero). This means the model begins training as a perfectly standard transformer. Language-aware routing emerges organically during optimization rather than being imposed a priori. Heads that find structural signals useful amplify them; heads that do not remain standard semantic attention heads.
+
+### 8.6 Why Pairwise Divergence?
+Defining switch magnitude as a purely sequential property $s_t = 1 - \mathbf{p}_t^\top \mathbf{p}_{t-1}$ is intuitive but insufficient for non-local attention, where the relevant structural relationship is between arbitrary positions $i$ and $j$. The pairwise divergence $\delta_{ij}$ generalizes this concept naturally, requires no parameters, and makes the attention bias inherently query-dependent.
+
+### 8.7 Why Soft Prototype Assignments?
+$K$ specifies the number of language attractors, not a hard partition. Because assignments are soft, ambiguous or mixed tokens naturally distribute mass across prototypes. The Adaptive EMA prior ensures that if the true number of dominant languages is less than $K$, the excess prototypes receive vanishingly small mass without destabilizing training.
+
+### 8.8 Why a Smooth Temperature Floor?
+A hard clamp on temperature introduces a gradient discontinuity and an arbitrary architectural constraint. Parameterizing $\tau$ via softplus with a stability floor $\tau_{\min} = 0.25$ guarantees numerical safety while preserving differentiability. The model can learn arbitrarily high temperatures (soft assignments) but is protected from precision collapse.
 
 ---
 

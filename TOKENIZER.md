@@ -222,9 +222,10 @@ python train_tokenizer.py \
 
 The script will:
 1. Stream all input files through `normalise()` into a single temporary file.
-2. Train the SentencePiece Unigram model with the parameters described above.
-3. Run a built-in verification suite to confirm special token IDs and roundtrip fidelity.
-4. Write `sberta.model` and `sberta.vocab` to the output directory.
+2. **Upsample Arabic script:** Lines containing >30% Arabic script are yielded 3x to mathematically prevent the Unigram algorithm from starving the Arabic vocabulary in Arabizi-dominated corpora.
+3. Train the SentencePiece Unigram model with the parameters described above.
+4. Run a built-in verification suite to confirm special token IDs and roundtrip fidelity.
+5. Write `sberta.model` and `sberta.vocab` to the output directory.
 
 Key CLI options:
 
@@ -233,5 +234,8 @@ Key CLI options:
 | `--vocab_size` | 50265 | Must match `SBERTaConfig.vocab_size` |
 | `--num_threads` | 4 | Parallelism for SP training |
 | `--min_chars` | 5 | Minimum characters per line after normalisation |
+| `--max_lines` | — | Cap input lines (useful for fast iteration) |
+| `--no_verify` | false | Skip post-training verification |
+`--min_chars` | 5 | Minimum characters per line after normalisation |
 | `--max_lines` | — | Cap input lines (useful for fast iteration) |
 | `--no_verify` | false | Skip post-training verification |

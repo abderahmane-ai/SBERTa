@@ -30,11 +30,11 @@ Full mathematical specification in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 The short version:
 
-- **Two-Phase Encoder:** Phase 1 builds language-agnostic contextual representations. The language pivot assigns prototypes based on context. Phase 2 applies language-aware attention.
+- **Two-Phase Encoder:** Phase 1 uses Pre-LN and SDPA (FlashAttention) to build language-agnostic context. The language pivot assigns prototypes based on context. Phase 2 applies language-aware attention.
 - **Embeddings:** GDES. Token embeddings are shaped purely by the Generator.
 - **Generator Masking:** Standard geometric span masking independent of language predictions.
-- **Language Discovery:** p is computed from Phase 1 contextual outputs. Sinkhorn-Knopp clusters them using an adaptive EMA prior that discovers the true corpus language distribution online.
-- **Attention:** Phase 2 routes information based on the discovered clusters via per-head K×K compatibility matrices.
+- **Language Discovery:** p is computed from Phase 1. Sinkhorn-Knopp clusters them using an adaptive EMA prior and a softplus temperature floor.
+- **Attention:** Phase 2 routes information via pairwise language divergence ($\delta_{ij}$) and K×K compatibility matrices, starting from a pure zero-initialized semantic state to discover structural signals organically.
 - **Pooling:** No [CLS] token. Sentence representations use mean pooling over real token positions.
 
 ---
