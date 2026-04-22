@@ -157,7 +157,7 @@ $$\mathcal{L} = \mathcal{L}_{\text{gen}} + w_{\text{rtd}} \cdot \mathcal{L}_{\te
 SBERTa does not use a [CLS] token. For sentence-level tasks, mean pooling over real tokens provides the semantic centroid:
 $$\mathbf{z}_{\text{sem}} = \frac{1}{|\mathcal{R}|} \sum_{t \in \mathcal{R}} \mathbf{h}_t^{(L)}$$
 
-Because code-switching structure is often discriminative, the language trajectory $\{\mathbf{p}_t\}_{t \in \mathcal{R}}$ and derived boundary sequence $\{s_t\}$ provide a complementary structural signature. For tasks requiring explicit switch-awareness, representations can be augmented with a pooled summary of the language trajectory. By default, mean pooling treats all languages democratically while the Phase-2 hidden states retain full language-aware context.
+Because code-switching structure is often discriminative, the language trajectory $\{\mathbf{p}_t\}_{t \in \mathcal{R}}$ provides a complementary structural signature. The sequential switch magnitude $s_t = 1 - \mathbf{p}_t^\top \mathbf{p}_{t-1}$ is derived directly from $\mathbf{p}$ and is returned as a diagnostic from `forward_phase1`; it is not an independent model output. For tasks requiring explicit switch-awareness, representations can be augmented with a pooled summary of the language trajectory. By default, mean pooling treats all languages democratically while the Phase-2 hidden states retain full language-aware context.
 
 ---
 

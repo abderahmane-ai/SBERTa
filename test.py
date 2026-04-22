@@ -389,8 +389,8 @@ def _purity(model: SBERTaForPreTraining, cfg: SBERTaConfig) -> tuple[float, floa
     with torch.no_grad():
         ids_a, mask_a, _ = _make_batch(seq_len=SEQ_LEN, batch_size=32, mode="mono_a")
         ids_b, mask_b, _ = _make_batch(seq_len=SEQ_LEN, batch_size=32, mode="mono_b")
-        _, p_a, _ = model.sberta.forward_phase1(ids_a, mask_a)
-        _, p_b, _ = model.sberta.forward_phase1(ids_b, mask_b)
+        _, p_a, _, _ = model.sberta.forward_phase1(ids_a, mask_a)
+        _, p_b, _, _ = model.sberta.forward_phase1(ids_b, mask_b)
         dom_a = p_a.argmax(-1).float().mean().item()
         dom_b = p_b.argmax(-1).float().mean().item()
     model.train()
@@ -429,7 +429,7 @@ def test_t5_prototype_separation():
     for step in range(STEPS_A):
         mode = "mono_a" if step % 2 == 0 else "mono_b"
         ids, mask, _ = _make_batch(seq_len=SEQ_LEN, batch_size=8, mode=mode)
-        _, p, _ = model_a.sberta.forward_phase1(ids, mask)
+        _, p, _, _ = model_a.sberta.forward_phase1(ids, mask)
         lang_label = 0 if mode == "mono_a" else 1
         tgt = torch.full((8 * SEQ_LEN,), lang_label, dtype=torch.long, device=DEVICE)
         ce = F.nll_loss(torch.log(p.view(-1, cfg_a.num_languages) + 1e-9), tgt)
@@ -456,7 +456,7 @@ def test_t5_prototype_separation():
     for step in range(STEPS_B):
         mode = "mono_a" if step % 2 == 0 else "mono_b"
         ids, mask, _ = _make_batch(seq_len=SEQ_LEN, batch_size=16, mode=mode)
-        _, p, _ = model_b.sberta.forward_phase1(ids, mask)
+        _, p, _, _ = model_b.sberta.forward_phase1(ids, mask)
         lang_label = 0 if mode == "mono_a" else 1
         tgt = torch.full((16 * SEQ_LEN,), lang_label, dtype=torch.long, device=DEVICE)
         ce = F.nll_loss(torch.log(p.view(-1, cfg_b.num_languages) + 1e-9), tgt)

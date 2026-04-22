@@ -287,7 +287,7 @@ class SBERTaForSequenceClassification(nn.Module):
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
         
-        H, _p0, _s = self.encoder(input_ids, attention_mask)  # (B, T, d)
+        H, _p0, _s, _h_base = self.encoder(input_ids, attention_mask)  # (B, T, d)
         
         # Masked mean pool over real tokens
         mask_f = attention_mask.float().unsqueeze(-1)          # (B, T, 1)
@@ -498,16 +498,44 @@ def finetune(
         task, label_map, len(train_ds), len(dev_ds), len(test_ds),
     )
     
-    # ── Optimiser — frozen encoder, head only ─────────────────────────────
-    # Encoder is frozen; only the classification head is trained.
+    # ── Optimiser — Layer-wise Learning Rate Decay (LLRD) ─────────────────
+    # We must protect Phase 1 (which has rich zero-shot semantics) while
+    # aggressively retraining Phase 2 to forget the RTD task and learn Sentiment.
     for param in model.encoder.parameters():
-        param.requires_grad_(False)
+        param.requires_grad_(True)
     
-    head_params = list(model.classifier.parameters())
+    # Base learning rate for Phase 2 and the Head
+    lr_head   = learning_rate
+    lr_phase2 = learning_rate * 0.5
+    lr_phase1 = learning_rate * 0.05  # 20x smaller to protect deep semantics
     
+    phase1_params = []
+    phase2_params = []
+    head_params   = []
+    
+    # model.encoder is SBERTaModel
+    # model.encoder.embeddings and model.encoder.layers[:n_base] are Phase 1
+    n_base = model.encoder.config.n_base_layers
+    
+    for name, param in model.named_parameters():
+        if "classifier" in name or "dropout" in name:
+            head_params.append(param)
+        elif "encoder.layers." in name:
+            layer_num = int(name.split("encoder.layers.")[1].split(".")[0])
+            if layer_num < n_base:
+                phase1_params.append(param)
+            else:
+                phase2_params.append(param)
+        else:
+            # Embeddings and prototypes go to Phase 1
+            phase1_params.append(param)
+
     optimizer = torch.optim.AdamW(
-        head_params,
-        lr=learning_rate,
+        [
+            {"params": head_params,   "lr": lr_head},
+            {"params": phase2_params, "lr": lr_phase2},
+            {"params": phase1_params, "lr": lr_phase1},
+        ],
         weight_decay=weight_decay,
         betas=(0.9, 0.999),
         eps=1e-8,
@@ -533,9 +561,9 @@ def finetune(
     
     log.info(
         "Fine-tuning: %d epochs × %d batches = %d steps  "
-        "(warmup=%d, LR=%.1e, encoder=frozen)",
+        "(warmup=%d, LR_head=%.1e, LR_p2=%.1e, LR_p1=%.1e)",
         epochs, len(train_loader), total_steps,
-        warmup_steps, learning_rate,
+        warmup_steps, lr_head, lr_phase2, lr_phase1,
     )
     
     for epoch in range(1, epochs + 1):
@@ -604,13 +632,39 @@ def finetune(
     
     log.info("=" * 60)
     log.info("TEST RESULTS (best dev checkpoint, step %d)", best_step)
-    log.info("  Accuracy  : %.2f%%", test_metrics["acc"] * 100.0)
-    log.info("  Macro F1  : %.4f",   test_metrics["macro_f1"])
+    log.info("  [4-Class] Accuracy  : %.2f%%", test_metrics["acc"] * 100.0)
+    log.info("  [4-Class] Macro F1  : %.4f",   test_metrics["macro_f1"])
     log.info("  Per-class F1: %s", {
         k: f"{v:.4f}" for k, v in
         zip(LABEL_MAPS[task].keys(), test_metrics["per_class_f1"])
     })
-    log.info("  DziriBERT baseline (sentiment acc): 80.5%%")
+    
+    # 3-Class Evaluation (ignoring MIX) for DziriBERT comparison
+    if task == "sentiment":
+        # MIX is class index 3
+        test_preds = []
+        test_labels = []
+        model.eval()
+        with torch.no_grad():
+            for batch in test_loader:
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                labels = batch["labels"]
+                
+                out = model(input_ids, attention_mask)
+                preds = out["logits"].argmax(dim=-1).cpu()
+                
+                # Filter out the MIX class
+                mask = labels != 3
+                test_preds.extend(preds[mask].tolist())
+                test_labels.extend(labels[mask].tolist())
+                
+        # Calculate accuracy on 3 classes
+        if test_labels:
+            correct = sum(p == l for p, l in zip(test_preds, test_labels))
+            acc_3class = correct / len(test_labels) * 100.0
+            log.info("  [3-Class] Accuracy  : %.2f%%  (comparable to DziriBERT 80.5%%)", acc_3class)
+            
     log.info("=" * 60)
     
     # ── Save results ──────────────────────────────────────────────────────

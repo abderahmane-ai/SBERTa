@@ -61,20 +61,6 @@ from .config import SBERTaConfig
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 
-def _masked_mean_pool(H: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """
-    Mean-pool hidden states over real (non-padding) token positions.
-
-    Args:
-        H:    (B, T, d)
-        mask: (B, T) binary — 1 for real tokens, 0 for padding
-    Returns:
-        (B, d)
-    """
-    mask_f = mask.float().unsqueeze(-1)              # (B, T, 1)
-    return (H * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1.0)
-
-
 def _geometric_span_mask(
     attention_mask: torch.Tensor,
     mask_prob: float,
@@ -296,14 +282,17 @@ class SBERTaEmbeddings(nn.Module):
 class SBERTaAttention(nn.Module):
     """
     Multi-head self-attention with an optional per-head K×K language-compatibility
-    bias and switch-position scalar, used in Phase 2 layers.
+    bias term, used in Phase 2 layers.
 
     Phase 1 layers instantiate this module with use_lang_bias=False, in which
     case the attention reduces to standard scaled dot-product attention and the
-    compat / gamma parameters are not created.
+    compat / beta / gamma parameters are not created.
 
     Phase 2 score:
       S_h(i,j) = (Qᵢ · Kⱼ) / √dₕ  +  β · pᵢᵀ Cₕ pⱼ  +  γ · δ_ij
+
+    where δ_ij = 1 − pᵢᵀ pⱼ is the pairwise language divergence (computed from
+    p inside forward; no separate s argument is required).
 
     Cₕ ∈ ℝ^{K×K} per head, initialised to zero (starts from standard
     attention; learns asymmetric language affinities as training progresses).
@@ -345,10 +334,16 @@ class SBERTaAttention(nn.Module):
         self,
         H: torch.Tensor,                               # (B, T, d)
         p: Optional[torch.Tensor] = None,              # (B, T, K) — required for Phase 2
-        s: Optional[torch.Tensor] = None,              # (B, T)    — required for Phase 2
         additive_mask: Optional[torch.Tensor] = None,  # (B, 1, 1, T)
     ) -> torch.Tensor:
-        B, T, _ = H.shape
+        """
+        Args:
+            H:            (B, T, d) — input hidden states
+            p:            (B, T, K) — language distributions; None for Phase 1 layers
+            additive_mask:(B, 1, 1, T) — additive padding mask (-10 000 at pad positions)
+        Returns:
+            (B, T, d)
+        """
 
         Q  = self._split(self.W_Q(H))
         K_ = self._split(self.W_K(H))
@@ -415,7 +410,6 @@ class SBERTaLayer(nn.Module):
         self,
         H: torch.Tensor,
         p: Optional[torch.Tensor] = None,
-        s: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if attention_mask is not None:
@@ -425,7 +419,7 @@ class SBERTaLayer(nn.Module):
         else:
             additive = None
 
-        H_attn = self.attention(self.norm_attn(H), p, s, additive)
+        H_attn = self.attention(self.norm_attn(H), p, additive)
         H_mid  = H + self.dropout(H_attn)
         return H_mid + self.dropout(self.ffn(self.norm_ffn(H_mid)))
 
@@ -532,10 +526,10 @@ class SBERTaModel(nn.Module):
     """
     Bare SBERTa encoder — zero-knowledge, script-agnostic, two-phase.
 
-    forward_phase1: runs Phase 1 layers only and returns H_base, p, s.
-                    Used by the pre-training wrapper to compute clustering
-                    losses on clean (unmasked) contextual representations
-                    without running the full Phase 2 forward pass.
+    forward_phase1: runs Phase 1 layers only and returns H_base, p, s, H_base_norm.
+                    H_base_norm = final_norm(H_base) is returned so that
+                    SBERTaForPreTraining can reuse it for L_cluster without a
+                    second LayerNorm call on the same tensor.
 
     forward: full two-phase pass, returning H_final, p, s, H_base.
     """
@@ -556,7 +550,7 @@ class SBERTaModel(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         stop_embedding_grad: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Phase 1 forward only — contextual representations before language assignment.
 
@@ -565,17 +559,20 @@ class SBERTaModel(nn.Module):
             attention_mask:      (B, T) binary
             stop_embedding_grad: If True, detach token embeddings (GDES)
         Returns:
-            H_base: (B, T, d) — Phase 1 contextual hidden states
-            p:      (B, T, K) — language distributions from H_base
-            s:      (B, T)    — switch magnitudes
+            H_base:      (B, T, d) — Phase 1 contextual hidden states
+            p:           (B, T, K) — language distributions from H_base
+            s:           (B, T)    — switch magnitudes
+            H_base_norm: (B, T, d) — final_norm(H_base), cached to avoid a
+                                     redundant LN call in SBERTaForPreTraining
         """
         H = self.embeddings(input_ids, stop_grad=stop_embedding_grad)
         for layer in self.layers[: self.config.n_base_layers]:
             H = layer(H, attention_mask=attention_mask)
         H_base = H
-        p = self.prototypes.get_distributions(self.final_norm(H_base))
+        H_base_norm = self.final_norm(H_base)
+        p = self.prototypes.get_distributions(H_base_norm)
         s = self.prototypes.get_switch_magnitudes(p)
-        return H_base, p, s
+        return H_base, p, s, H_base_norm
 
     def forward(
         self,
@@ -596,10 +593,10 @@ class SBERTaModel(nn.Module):
             s:      (B, T)    — switch magnitudes
             H_base: (B, T, d) — Phase 1 hidden states (pivot point)
         """
-        H_base, p, s = self.forward_phase1(input_ids, attention_mask, stop_embedding_grad)
+        H_base, p, s, _ = self.forward_phase1(input_ids, attention_mask, stop_embedding_grad)
         H = H_base
         for layer in self.layers[self.config.n_base_layers :]:
-            H = layer(H, p, s, attention_mask)
+            H = layer(H, p, attention_mask)
         H = self.final_norm(H)
         return H, p, s, H_base
 
@@ -685,16 +682,20 @@ class SBERTaForPreTraining(nn.Module):
         # ── Step 1: Phase 1 forward on clean input ────────────────────────
         # H_base is contextual — meaningful for prototype assignment.
         # p and s are derived from real (unmasked) language structure.
-        H_base, p, s = self.sberta.forward_phase1(input_ids, attention_mask)
+        # H_base_norm is cached here to avoid calling final_norm(H_base) again
+        # below for L_cluster (same tensor, same forward pass).
+        H_base, p, s, H_base_norm = self.sberta.forward_phase1(input_ids, attention_mask)
+
+        # Cache normalized prototypes once — reused by both L_cluster and
+        # L_ortho. This makes the invariant (same parameter, same pass) explicit
+        # and avoids three separate F.normalize calls on the same nn.Parameter.
+        L_norm = F.normalize(self.sberta.prototypes.prototypes, dim=-1)  # (K, d)
 
         # ── L_cluster: Sinkhorn on Phase 1 contextual representations ─────
+        # Reuses H_base_norm from forward_phase1 — no second final_norm call.
         # Scores mirror get_distributions exactly (same dot-product / tau).
-        real_h       = self.sberta.final_norm(H_base)[real]                  # (N_real, d)
-        L_norm       = F.normalize(self.sberta.prototypes.prototypes, dim=-1)
-        proto_scores = (
-            real_h @ L_norm.T
-            / self.sberta.prototypes.tau
-        )                                                                    # (N_real, K)
+        real_h       = H_base_norm[real]                                    # (N_real, d)
+        proto_scores = real_h @ L_norm.T / self.sberta.prototypes.tau      # (N_real, K)
         Q = _sinkhorn(
             proto_scores.detach(),
             cfg.sinkhorn_epsilon,
@@ -714,12 +715,10 @@ class SBERTaForPreTraining(nn.Module):
             )
 
         # ── L_ortho: prototype geometry ───────────────────────────────────
-        # Penalises off-diagonal entries of the Gram matrix of normalised
-        # prototypes. Prevents prototype vectors from drifting together
-        # regardless of assignment dynamics.
-        L_n       = F.normalize(self.sberta.prototypes.prototypes, dim=-1)  # (K, d)
-        gram      = L_n @ L_n.T                                              # (K, K)
-        eye       = torch.eye(cfg.num_languages, device=gram.device)
+        # Reuses L_norm cached above — prevents prototype vectors from drifting
+        # together regardless of assignment dynamics.
+        gram       = L_norm @ L_norm.T                                      # (K, K)
+        eye        = torch.eye(cfg.num_languages, device=gram.device)
         loss_ortho = (gram - eye).pow(2).mean()
 
         # ── Step 2: geometric span masking ────────────────────────────────
