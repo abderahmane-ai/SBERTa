@@ -126,7 +126,16 @@ Instead of standard random token masking, SBERTa masks geometric spans.
 Span lengths are sampled from a Geometric distribution $\text{Geom}(p)$ with a mean length of $1/p$ tokens.
 Crucially, this masking is language-agnostic and completely independent of $\mathbf{p}$. This allows the generator to focus purely on reconstructing context without relying on language predictions.
 
----
+### 5.4 Phase-Separated Layer Normalisation
+
+The encoder uses two independent `LayerNorm` modules rather than one shared final norm:
+
+| Norm | Input | Gradient source | Purpose |
+|------|-------|-----------------|---------|
+| `phase1_norm` | $\mathbf{H}_{\text{base}}$ (Phase 1 output) | $\mathcal{L}_{\text{cluster}}$ only | Normalise for prototype cosine similarity |
+| `final_norm` | $\mathbf{H}$ (Phase 2 output) | $\mathcal{L}_{\text{RTD}}$ only | Normalise for RTD binary head |
+
+A shared norm would receive gradients from both objectives through representations at entirely different stages of processing, creating implicit competition between the clustering and discrimination objectives over shared normalisation parameters. Keeping them independent ensures each norm is optimised for its specific representational role.
 
 ## 6. Training Objectives
 

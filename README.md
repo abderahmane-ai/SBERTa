@@ -50,14 +50,6 @@ The short version:
 
 ---
 
-## Fine-tuning
-
-`finetune_narabizi.py` fine-tunes a pre-trained SBERTa encoder on the [NArabizi dataset](https://github.com/SamiaTouileb/NArabizi) (Touileb & Barnes, ACL 2021 Findings) for sentiment classification (NEG/NEU/POS) and topic classification (Religion/Societal/Sport/NONE).
-
-Baseline to beat: DziriBERT sentiment accuracy 80.5%.
-
----
-
 ## Project structure
 
 ```
@@ -65,8 +57,9 @@ sberta/
     model.py        — full architecture
     config.py       — configuration dataclass
     tokenizer.py    — SentencePiece wrapper
+pretrain.py         — pre-training loop
+test.py             — synthetic architecture test suite
 corpus/             — training data
-finetune_narabizi.py
 ARCHITECTURE.md     — mathematical specification
 ```
 

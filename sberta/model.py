@@ -527,7 +527,7 @@ class SBERTaModel(nn.Module):
     Bare SBERTa encoder — zero-knowledge, script-agnostic, two-phase.
 
     forward_phase1: runs Phase 1 layers only and returns H_base, p, s, H_base_norm.
-                    H_base_norm = final_norm(H_base) is returned so that
+                    H_base_norm = phase1_norm(H_base) is returned so that
                     SBERTaForPreTraining can reuse it for L_cluster without a
                     second LayerNorm call on the same tensor.
 
@@ -543,7 +543,15 @@ class SBERTaModel(nn.Module):
             SBERTaLayer(config, use_lang_bias=(i >= config.n_base_layers))
             for i in range(config.num_hidden_layers)
         ])
-        self.final_norm: nn.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        # Two independent LayerNorms — one per phase, one per gradient source.
+        # phase1_norm: normalises Phase 1 output for prototype cosine similarity;
+        #              receives only L_cluster gradients.
+        # final_norm:  normalises Phase 2 output for the RTD binary head;
+        #              receives only L_RTD gradients.
+        # Keeping them separate prevents the two objectives from competing
+        # over shared normalisation parameters.
+        self.phase1_norm: nn.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.final_norm:  nn.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def forward_phase1(
         self,
@@ -562,14 +570,16 @@ class SBERTaModel(nn.Module):
             H_base:      (B, T, d) — Phase 1 contextual hidden states
             p:           (B, T, K) — language distributions from H_base
             s:           (B, T)    — switch magnitudes
-            H_base_norm: (B, T, d) — final_norm(H_base), cached to avoid a
-                                     redundant LN call in SBERTaForPreTraining
+            H_base_norm: (B, T, d) — phase1_norm(H_base); cached so
+                                     SBERTaForPreTraining can reuse it for
+                                     L_cluster without a second LN call.
+                                     Receives L_cluster gradients only.
         """
         H = self.embeddings(input_ids, stop_grad=stop_embedding_grad)
         for layer in self.layers[: self.config.n_base_layers]:
             H = layer(H, attention_mask=attention_mask)
         H_base = H
-        H_base_norm = self.final_norm(H_base)
+        H_base_norm = self.phase1_norm(H_base)
         p = self.prototypes.get_distributions(H_base_norm)
         s = self.prototypes.get_switch_magnitudes(p)
         return H_base, p, s, H_base_norm
@@ -682,7 +692,7 @@ class SBERTaForPreTraining(nn.Module):
         # ── Step 1: Phase 1 forward on clean input ────────────────────────
         # H_base is contextual — meaningful for prototype assignment.
         # p and s are derived from real (unmasked) language structure.
-        # H_base_norm is cached here to avoid calling final_norm(H_base) again
+        # H_base_norm is cached here to avoid calling phase1_norm(H_base) again
         # below for L_cluster (same tensor, same forward pass).
         H_base, p, s, H_base_norm = self.sberta.forward_phase1(input_ids, attention_mask)
 

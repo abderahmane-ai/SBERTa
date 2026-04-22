@@ -34,6 +34,14 @@ class SBERTaConfig:
     # p is a real signal by the time it reaches these layers.
     #
     # Constraint: 0 < n_base_layers < num_hidden_layers.
+    #
+    # n_base_layers is a hyperparameter to sweep for each new corpus.
+    # The bootstrap paradox justifies that Phase 1 must be long enough for
+    # distributional clustering to emerge (empirically ≥ 4 layers seems
+    # necessary; shallower Phase 1 risks p being noise when Phase 2 starts
+    # specialising). The default of L/2 is a reasonable starting point but
+    # should be validated: try {L//3, L//2, 2*L//3} and pick by prototype
+    # entropy at step 10K.
     n_base_layers: int = 6
 
     # ── Code-switching ────────────────────────────────────────────────────
