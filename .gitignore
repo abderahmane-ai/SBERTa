@@ -32,9 +32,16 @@ venv.bak/
 
 # Project Specific
 corpus/
-data/
+data/*
+!data/*.jsonl
+!data/*.json
 data_strategy/
 runs/
+raw_data/
+cleaned_data/
+reports/
+FINAL_DARIJA_CORPUS/
+mission_log.txt
 *.model
 *.vocab
 *.tar
@@ -48,3 +55,12 @@ runs/
 
 # Embedded repositories
 benchmarks/NArabizi/
+
+# System
+.DS_Store
+
+# Dev Tools
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage

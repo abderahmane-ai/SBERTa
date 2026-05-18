@@ -101,6 +101,14 @@ python scripts/prepare_corpus.py \
   --usage pretraining
 ```
 
+Run the acquisition mission for the registered Algerian Darija sources:
+
+```bash
+python scripts/darija_data_mission.py
+```
+
+It writes raw exports, cleaned corpus files, a `cl100k_base` token report, quality-tier/source breakdowns, and spot-check samples. See [DATA.md](DATA.md) for the source registry and compliance policy.
+
 Target for v1: at least 500 MB of cleaned Algerian-centric text, ideally 1-2 GB, with Roman-script / Arabizi text kept above 25%.
 
 ---
@@ -143,8 +151,11 @@ pretrain.py         stable Darija pre-training loop
 train_tokenizer.py  SentencePiece Unigram training
 test.py             synthetic and stability tests
 scripts/
+    darija_data_mission.py
     prepare_corpus.py
     evaluate_benchmarks.py
+configs/
+    darija_sources.json
 DATA.md             data sources, manifest, usage policy
 BENCHMARKS.md       DziriBERT comparison protocol
 ARCHITECTURE.md     architecture specification

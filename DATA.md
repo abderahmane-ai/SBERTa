@@ -4,7 +4,7 @@ The v1 data target is at least 500 MB of cleaned Algerian-centric text, ideally 
 
 ## Manifest
 
-Every prepared source appends one JSON object to `data/manifest.jsonl` with:
+The acquisition mission appends one JSON object to `data/manifest.jsonl` after every run. Each record includes:
 
 - source name and input paths,
 - output path and byte size,
@@ -12,6 +12,16 @@ Every prepared source appends one JSON object to `data/manifest.jsonl` with:
 - allowed usage: `pretraining`, `evaluation`, `research-only`, or `restricted`,
 - total, kept, filtered, and duplicate line counts,
 - mean Arabic/Latin ratios and Arabizi token count.
+
+Run the full Algerian Darija acquisition and cleaning mission:
+
+```bash
+python scripts/darija_data_mission.py
+```
+
+It writes raw source exports to `raw_data/`, cleaned JSONL/TXT to `cleaned_data/`, reports to `reports/`, and copies the final corpus to `FINAL_DARIJA_CORPUS/` only after the configured token target is reached. The report uses `cl100k_base` token counts and includes source breakdowns, script distribution, quality tiers, perplexity histogram, top words, and spot-check samples.
+
+The source registry lives in `configs/darija_sources.json`. Active entries currently cover public/licensed Algerian Darija sources from Hugging Face and Zenodo, CAFE transcript extraction, and gated/manual entries for sources that require credentials or benchmark isolation.
 
 Use:
 

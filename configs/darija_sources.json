@@ -1,0 +1,151 @@
+[
+  {
+    "name": "ayoubkirouane_algerian_darija_v1",
+    "type": "huggingface",
+    "dataset": "ayoubkirouane/Algerian-Darija",
+    "split": "v1",
+    "license_status": "cc-by-4.0",
+    "usage": "pretraining",
+    "dialect": "algerian",
+    "quality_tier": "conversational_web",
+    "text_fields": ["Text", "text", "sentence", "content"]
+  },
+  {
+    "name": "sepidmnorozy_algerian_sentiment",
+    "type": "huggingface",
+    "dataset": "sepidmnorozy/Algerian_sentiment",
+    "split": "train",
+    "license_status": "check Hugging Face dataset card before redistribution",
+    "usage": "pretraining",
+    "dialect": "algerian",
+    "quality_tier": "conversational_social",
+    "text_fields": ["text", "comment", "sentence"]
+  },
+  {
+    "name": "abdou_dz_sentiment_youtube_comments",
+    "type": "huggingface",
+    "dataset": "Abdou/dz-sentiment-yt-comments",
+    "split": "train",
+    "license_status": "mit",
+    "usage": "pretraining",
+    "dialect": "algerian",
+    "quality_tier": "conversational_social",
+    "text_fields": ["text", "comment", "comments"]
+  },
+  {
+    "name": "algerian_toxicity_zenodo",
+    "type": "url",
+    "url": "https://zenodo.org/records/10937445/files/AlgD_Toxicity_Speech_Dataset.xlsx?download=1",
+    "file_name": "AlgD_Toxicity_Speech_Dataset.xlsx",
+    "format": "xlsx",
+    "license_status": "cc-by-4.0",
+    "usage": "pretraining_sensitive",
+    "dialect": "algerian",
+    "quality_tier": "conversational_social_sensitive",
+    "text_fields": ["text", "Text", "comment", "Comment", "tweet", "Tweet", "content", "Content"]
+  },
+  {
+    "name": "algerian_sentiment_zenodo_11760",
+    "type": "url",
+    "url": "https://zenodo.org/records/10937412/files/Sentiment_dataset_of_Algerian_dialect%20%2811760%29.xlsx?download=1",
+    "file_name": "Sentiment_dataset_of_Algerian_dialect_11760.xlsx",
+    "format": "xlsx",
+    "license_status": "open dataset; check Zenodo terms before redistribution",
+    "usage": "pretraining_sensitive",
+    "dialect": "algerian",
+    "quality_tier": "conversational_social_sensitive",
+    "text_fields": ["text", "Text", "comment", "Comment", "tweet", "Tweet", "content", "Content"]
+  },
+  {
+    "name": "algerian_realestate_ner",
+    "type": "huggingface",
+    "dataset": "81melody/algerian-realestate-ner-dataset",
+    "split": "train",
+    "license_status": "apache-2.0",
+    "usage": "pretraining_domain_aug",
+    "dialect": "algerian",
+    "quality_tier": "domain_social",
+    "trusted_source": false,
+    "text_fields": ["tokens", "text", "sentence", "content"]
+  },
+  {
+    "name": "openner_maghrebi_arabizi_arq",
+    "type": "huggingface",
+    "dataset": "bltlab/open-ner-standardized",
+    "config": "UNER_Maghrebi_Arabic_French-Arabizi_arq",
+    "split": "train",
+    "license_status": "check Hugging Face dataset card before redistribution",
+    "usage": "pretraining_domain_aug",
+    "dialect": "algerian_or_maghrebi_arabizi",
+    "quality_tier": "domain_social",
+    "trusted_source": false,
+    "text_fields": ["tokens", "text", "sentence", "content"]
+  },
+  {
+    "name": "elner_dz",
+    "type": "huggingface",
+    "dataset": "HadjerHaninebgt7878/ELNER-DZ",
+    "split": "train",
+    "license_status": "cc-by-4.0",
+    "usage": "pretraining",
+    "dialect": "algerian",
+    "quality_tier": "entity_augmented",
+    "trusted_source": false,
+    "max_source_tokens": 60000000,
+    "text_fields": ["text", "sentence", "tokens", "content"]
+  },
+  {
+    "name": "cafe_small_transcripts",
+    "type": "url",
+    "url": "https://zenodo.org/records/16964503/files/cafe-small.zip?download=1",
+    "file_name": "cafe-small.zip",
+    "format": "zip",
+    "license_status": "cc-by-4.0",
+    "usage": "pretraining_speech_transcripts",
+    "dialect": "algerian_code_switching_speech",
+    "quality_tier": "speech_transcript",
+    "zip_member_pattern": "(transcript|processed|raw|pseudo|csv|json)",
+    "text_fields": ["processed_transcription", "original_transcription", "transcription", "text", "utterance", "sentence"]
+  },
+  {
+    "name": "arsyra_maghrebi_algeria_only",
+    "type": "huggingface",
+    "dataset": "ArSyra/arsyra-maghrebi",
+    "split": "train",
+    "license_status": "check dataset card before redistribution",
+    "usage": "pretraining",
+    "dialect": "mixed_maghrebi",
+    "quality_tier": "filtered_maghrebi",
+    "filter": {"country": ["Algeria", "DZ", "Algerie", "الجزائر"]},
+    "text_fields": ["text", "sentence", "content", "utterance", "darija"]
+  },
+  {
+    "name": "narabizi_unlabeled",
+    "type": "manual",
+    "url": "https://parsiti.github.io/NArabizi/",
+    "license_status": "check project license; keep annotated benchmark splits isolated",
+    "usage": "pretraining_or_evaluation",
+    "dialect": "algerian_arabizi",
+    "notes": "Use unlabeled portion for pretraining only after deduping against NArabizi eval splits."
+  },
+  {
+    "name": "narabizi_hf_eval_only",
+    "type": "huggingface",
+    "dataset": "arbml/NArabizi",
+    "split": "train",
+    "license_status": "check Hugging Face dataset card before redistribution",
+    "usage": "evaluation_only",
+    "dialect": "algerian_arabizi",
+    "disabled": true,
+    "notes": "Benchmark-sized labelled split; keep out of pretraining to avoid DziriBERT comparison contamination."
+  },
+  {
+    "name": "cafe_transcripts",
+    "type": "manual",
+    "url": "https://arxiv.org/abs/2411.13424",
+    "license_status": "check Zenodo release terms",
+    "usage": "pretraining",
+    "dialect": "algerian_speech",
+    "notes": "Extract processed_transcription/original_transcription from released JSON transcripts if available."
+  }
+]

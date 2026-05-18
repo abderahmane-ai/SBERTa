@@ -1,0 +1,61 @@
+[
+  {
+    "name": "ayoubkirouane_algerian_darija_v1",
+    "type": "huggingface",
+    "dataset": "ayoubkirouane/Algerian-Darija",
+    "split": "v1",
+    "license_status": "cc-by-4.0",
+    "usage": "pretraining",
+    "dialect": "algerian",
+    "text_fields": ["Text", "text", "sentence", "content"]
+  },
+  {
+    "name": "abdou_dz_sentiment_youtube_comments",
+    "type": "huggingface",
+    "dataset": "Abdou/dz-sentiment-yt-comments",
+    "split": "train",
+    "license_status": "mit",
+    "usage": "pretraining",
+    "dialect": "algerian",
+    "text_fields": ["text", "comment", "comments"]
+  },
+  {
+    "name": "elner_dz",
+    "type": "huggingface",
+    "dataset": "HadjerHaninebgt7878/ELNER-DZ",
+    "split": "train",
+    "license_status": "check dataset card; source is Darija/Arabizi NER+EL",
+    "usage": "pretraining",
+    "dialect": "algerian",
+    "text_fields": ["text", "sentence", "tokens", "content"]
+  },
+  {
+    "name": "arsyra_maghrebi_algeria_only",
+    "type": "huggingface",
+    "dataset": "ArSyra/arsyra-maghrebi",
+    "split": "train",
+    "license_status": "check dataset card before redistribution",
+    "usage": "pretraining",
+    "dialect": "mixed_maghrebi",
+    "filter": {"country": ["Algeria", "DZ", "Algerie", "الجزائر"]},
+    "text_fields": ["text", "sentence", "content", "utterance", "darija"]
+  },
+  {
+    "name": "narabizi_unlabeled",
+    "type": "manual",
+    "url": "https://parsiti.github.io/NArabizi/",
+    "license_status": "check project license; keep annotated benchmark splits isolated",
+    "usage": "pretraining_or_evaluation",
+    "dialect": "algerian_arabizi",
+    "notes": "Use unlabeled portion for pretraining only after deduping against NArabizi eval splits."
+  },
+  {
+    "name": "cafe_transcripts",
+    "type": "manual",
+    "url": "https://arxiv.org/abs/2411.13424",
+    "license_status": "check Zenodo release terms",
+    "usage": "pretraining",
+    "dialect": "algerian_speech",
+    "notes": "Extract processed_transcription/original_transcription from released JSON transcripts if available."
+  }
+]
