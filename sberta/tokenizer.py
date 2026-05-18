@@ -1,33 +1,4 @@
-"""
-SBERTa tokenizer — SentencePiece Unigram wrapper for Algerian Darija.
-
-Design
-------
-Algorithm      : SentencePiece Unigram LM — probabilistic segmentation via EM,
-                 optimal for morphologically rich and low-resource languages.
-                 Crucially, it supports subword regularisation: sampling from
-                 multiple valid segmentations at training time, acting as data
-                 augmentation for under-represented scripts (Berber/Tamazight).
-
-Vocab size     : 50,265 (matches SBERTaConfig default).
-
-Normalisation  : NFC → strip Arabic harakat → remove tatweel → Arabic-Indic
-                 digits to ASCII → lowercase non-Arabic uppercase → collapse
-                 whitespace. Arabizi digit-letters (3, 7, 9, …) are untouched:
-                 they are phonemic units and the SP model learns them as such.
-
-Script policy  : No script-boundary pre-tokenisation. Splitting on Arabic↔Latin
-                 transitions would guarantee clean switch boundaries but would
-                 contradict SBERTa's philosophy of deriving language identity
-                 endogenously from token embeddings. The prototype mechanism
-                 handles ambiguity; the tokeniser must not pre-empt it.
-
-Special tokens : [PAD]=0, [UNK]=1, [MASK]=2, [SEP]=3. No [CLS] — SBERTa uses
-                 mean pooling over H^(L) for sequence-level tasks.
-
-Byte fallback  : enabled — any unseen character maps to its UTF-8 byte tokens
-                 rather than [UNK], preserving all information at inference.
-"""
+"""SentencePiece Unigram wrapper for Algerian Darija."""
 
 from __future__ import annotations
 

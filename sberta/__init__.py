@@ -1,10 +1,4 @@
-"""
-SBERTa: Switch-aware Bidirectional Encoder Representations from
-        Transformers with Alternation.
-
-A transformer encoder for code-switched text, designed for Algerian Darija.
-See README.md for architecture description and quick-start guide.
-"""
+"""Darija-first SBERTa package."""
 
 from .config import SBERTaConfig
 from .model import (
@@ -27,8 +21,5 @@ __all__ = [
     "SBERTaLayer",
     "SBERTaModel",
     "SBERTaForPreTraining",
-    # Classification
-    "SBERTaForSequenceClassification",
-    # Tokenizer
     "SBERTaTokenizer",
 ]

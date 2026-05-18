@@ -1,66 +1,154 @@
 # SBERTa
 
-**Switching BERT architecture for code-switched text.**
+**Switching BERT architecture for Algerian Darija code-switching.**
 
-SBERTa is a transformer pre-trained specifically for code-switching — text that mixes languages within a sentence or document. It makes language identity and language boundaries explicit architectural components, learned end-to-end without any external labels, language detection tools, dictionaries, or Unicode script hints.
+SBERTa is a transformer pre-training project for Algerian Darija: Arabic script, Arabizi, French code-switching, Tamazight-influenced forms, and noisy social-media spelling. It treats code-switching as a structural signal rather than a nuisance, but keeps the training recipe deliberately stable and low-knob.
 
-While originally designed for Algerian Darija (Arabic script, Latin script, French loanwords, dialect Arabic), the architecture is now a **universal, zero-knowledge standard** capable of unsupervised language boundary discovery in any code-switched mixture (e.g., Spanglish, Hinglish, Franglais).
+The immediate goal is to build a Darija encoder that can beat **DziriBERT** on the same Algerian benchmarks, especially Roman-script / Arabizi tasks where DziriBERT is strongest. DziriBERT is a BERT-base style model with a 50k vocabulary, trained on roughly 1M Algerian tweets / 150 MB, and evaluated on Twifil and NArabizi ([paper](https://arxiv.org/abs/2109.12346), [GitHub](https://github.com/alger-ia/dziribert), [Hugging Face](https://huggingface.co/alger-ia/dziribert)).
 
 ---
 
-## What makes it different
+## What Makes It Different
 
-Standard multilingual models treat code-switching as noise. SBERTa treats it as a structural signal.
+Most multilingual models see Algerian code-switching as noise: script alternation, French insertions, Arabizi digit-phonemes, and inconsistent spelling all get flattened into generic multilingual capacity. SBERTa makes the structure explicit while still learning it from data.
 
-**Two-Phase Encoder** — SBERTa avoids the "bootstrap paradox" of early clustering. Phase 1 uses standard attention to build semantic context. Language prototypes are assigned from these contextual outputs at a pivot layer, before Phase 2 applies language-aware attention.
+**Two-Phase Encoder** — Phase 1 is standard self-attention and builds contextual representations without language bias. Language prototypes are assigned after this context exists. Phase 2 may use language-aware attention, but only after the training schedule allows it.
 
-**Language Prototypes & Sinkhorn-Knopp** — The model learns K prototype vectors. To prevent collapse, SBERTa uses **Optimal Transport (Sinkhorn-Knopp)**. Crucially, it uses an **Adaptive EMA Prior** to track the batch marginals, allowing the model to dynamically discover the true language distribution of the corpus without forcing a 50/50 split.
+**Darija Prototype States** — The default recipe uses `K=4` soft prototype states, intended for the dominant modes in Algerian text: Arabic-script Darija/MSA-like text, Arabizi/Roman script, French, and other borrowed/local forms. These are soft latent states, not supervised labels.
 
-**Zero-Knowledge Clustering** — SBERTa requires no Unicode priors or dictionaries. Language structure emerges purely from the Masked Language Modeling (MLM) objective, stabilized by the Sinkhorn clustering loss.
+**Sinkhorn-Knopp with Adaptive Prior** — Sinkhorn prevents prototype collapse, while the EMA prior tracks raw model probabilities instead of forcing a rigid uniform split. This keeps the clustering pressure useful without letting the prior simply echo Sinkhorn’s own constrained output.
 
-**Language-Aware Attention** — Each attention head in Phase 2 has a K×K compatibility matrix that learns asymmetric language affinities. An Arabic query attending to a Latin key gets a different bias than the reverse.
+**Language-Aware Attention** — Phase 2 layers contain per-head compatibility matrices and pairwise divergence terms. Their contribution is ramped in during training, so the model starts as a stable transformer and only later uses code-switching structure.
 
-**GDES & ELECTRA-style Pre-training** — A small generator proposes token replacements via geometric span masking; the discriminator detects them. SBERTa solves ELECTRA instability via **Gradient-Disentangled Embedding Sharing (GDES)**. The discriminator's gradients do not flow into the token embeddings, allowing the generator to build clean semantic clusters for the Sinkhorn algorithm to discover.
+**GDES + ELECTRA-Style Pre-Training** — A generator proposes replacements and a discriminator detects them. Discriminator gradients do not update token embeddings, following the DeBERTaV3/ELECTRA stability lesson that RTD can otherwise distort shared embeddings.
 
 ---
 
 ## Architecture
 
-Full mathematical specification in [ARCHITECTURE.md](ARCHITECTURE.md).
+Full mathematical and training specification: [ARCHITECTURE.md](ARCHITECTURE.md).
 
-The short version:
+Short version:
 
-- **Two-Phase Encoder:** Phase 1 uses Pre-LN and SDPA (FlashAttention) to build language-agnostic context. The language pivot assigns prototypes based on context. Phase 2 applies language-aware attention.
-- **Embeddings:** GDES. Token embeddings are shaped purely by the Generator.
-- **Generator Masking:** Standard geometric span masking independent of language predictions.
-- **Language Discovery:** p is computed from Phase 1. Sinkhorn-Knopp clusters them using an adaptive EMA prior and a softplus temperature floor.
-- **Attention:** Phase 2 routes information via pairwise language divergence ($\delta_{ij}$) and K×K compatibility matrices, starting from a pure zero-initialized semantic state to discover structural signals organically.
-- **Pooling:** No [CLS] token. Sentence representations use mean pooling over real token positions.
-
----
-
-## Configurations
-
-| Config | Hidden | Layers | Heads | FFN  | Params |
-|--------|--------|--------|-------|------|--------|
-| Small  | 256    | 4      | 4     | 1024 | ~17M   |
-| Medium | 512    | 8      | 8     | 2048 | ~55M   |
-| Base   | 768    | 12     | 12    | 3072 | ~136M  |
-| Large  | 1024   | 24     | 16    | 4096 | ~394M  |
+- **Embeddings:** token + position embeddings only; no script IDs or dictionaries.
+- **Phase 1:** standard Pre-LN self-attention.
+- **Pivot:** contextual states are mapped to soft prototype distributions.
+- **Phase 2:** language-aware attention can use prototype compatibility and pairwise language divergence.
+- **Pre-training:** generator MLM + discriminator RTD + scheduled clustering and orthogonality losses.
+- **Pooling:** no `[CLS]`; sentence representations use mean pooling over real tokens.
 
 ---
 
-## Project structure
+## Stable Training Recipe
 
+The public CLI intentionally exposes only high-ROI controls:
+
+```bash
+python pretrain.py \
+  --preset darija-medium \
+  --corpus-dirs corpus \
+  --tokenizer-dir runs/tokenizer \
+  --total-tokens 250000000 \
+  --micro-batch-size 16 \
+  --grad-accum 4 \
+  --run-id darija-medium-v1
 ```
+
+Everything else is fixed inside the preset: optimizer, warmup, dropout, span masking, Sinkhorn settings, prototype temperature, loss weights, clipping, logging, and checkpoint cadence.
+
+Training is staged:
+
+1. **Phase A:** generator MLM + RTD only.
+2. **Phase B:** prototype clustering and orthogonality ramp in.
+3. **Phase C:** language-aware attention ramps in once prototype entropy is healthy.
+
+The trainer logs RTD precision/recall/F1, replacement rate, prototype entropy, EMA prior, switch magnitude, gradient norm, AMP skips, and loss components.
+
+---
+
+## Presets
+
+| Preset | Hidden | Layers | Heads | FFN | K | Use |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `darija-small` | 256 | 4 | 4 | 1024 | 4 | Smoke tests and quick experiments |
+| `darija-medium` | 512 | 8 | 8 | 2048 | 4 | Recommended single-GPU run |
+| `darija-base` | 768 | 12 | 12 | 3072 | 4 | DziriBERT-scale comparison |
+
+---
+
+## Data And Tokenizer
+
+Tokenizer reference: [TOKENIZER.md](TOKENIZER.md).  
+Data policy and manifest format: [DATA.md](DATA.md).
+
+Train the tokenizer:
+
+```bash
+python train_tokenizer.py \
+  --input corpus/darija_pretrain.txt \
+  --output runs/tokenizer \
+  --vocab_size 50000
+```
+
+Prepare a corpus source and append manifest provenance:
+
+```bash
+python scripts/prepare_corpus.py \
+  --input data/raw/youtube \
+  --output corpus/darija_pretrain.txt \
+  --source-name youtube_algerian_channels \
+  --license-status "YouTube API, local research use" \
+  --usage pretraining
+```
+
+Target for v1: at least 500 MB of cleaned Algerian-centric text, ideally 1-2 GB, with Roman-script / Arabizi text kept above 25%.
+
+---
+
+## Benchmark Gate
+
+Benchmark protocol: [BENCHMARKS.md](BENCHMARKS.md).
+
+SBERTa v1 is successful only if it:
+
+- beats DziriBERT on NArabizi sentiment/topic,
+- is not worse on Twifil sentiment/emotion,
+- reports both accuracy and macro-F1,
+- uses identical splits and seeds for DziriBERT and SBERTa.
+
+Example:
+
+```bash
+python scripts/evaluate_benchmarks.py \
+  --task narabizi_sentiment \
+  --model dziribert \
+  --train data/narabizi/train.csv \
+  --dev data/narabizi/dev.csv \
+  --test data/narabizi/test.csv \
+  --output runs/benchmarks/dziribert_narabizi_sentiment.json
+```
+
+Use `--model sberta --sberta-checkpoint runs/darija-medium-v1/latest` for SBERTa.
+
+---
+
+## Project Structure
+
+```text
 sberta/
-    model.py        — full architecture
-    config.py       — configuration dataclass
-    tokenizer.py    — SentencePiece wrapper
-pretrain.py         — pre-training loop
-test.py             — synthetic architecture test suite
-corpus/             — training data
-ARCHITECTURE.md     — mathematical specification
+    model.py        architecture and pre-training wrapper
+    config.py       Darija presets and fixed recipe constants
+    tokenizer.py    SentencePiece wrapper and normaliser
+pretrain.py         stable Darija pre-training loop
+train_tokenizer.py  SentencePiece Unigram training
+test.py             synthetic and stability tests
+scripts/
+    prepare_corpus.py
+    evaluate_benchmarks.py
+DATA.md             data sources, manifest, usage policy
+BENCHMARKS.md       DziriBERT comparison protocol
+ARCHITECTURE.md     architecture specification
+TOKENIZER.md        tokenizer reference
 ```
 
 ---
@@ -69,8 +157,9 @@ ARCHITECTURE.md     — mathematical specification
 
 - Clark et al. (2020) — ELECTRA: Pre-training Text Encoders as Discriminators Rather Than Generators
 - He et al. (2021) — DeBERTaV3: Improving DeBERTa using ELECTRA-Style Pre-Training with Gradient-Disentangled Embedding Sharing
-- Caron et al. (2020) — SwAV: Unsupervised Learning of Visual Features by Contrasting Cluster Assignments (Sinkhorn-Knopp)
+- Caron et al. (2020) — SwAV: Unsupervised Learning of Visual Features by Contrasting Cluster Assignments
 - Kudo & Richardson (2018) — SentencePiece: A simple and language independent subword tokenizer
+- Abdaoui et al. (2021) — DziriBERT: a pre-trained language model for the Algerian dialect
 
 ---
 

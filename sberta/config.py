@@ -1,4 +1,4 @@
-"""SBERTa configuration dataclass."""
+"""Configuration for the Darija-first SBERTa recipe."""
 from __future__ import annotations
 
 import json
@@ -8,102 +8,76 @@ from pathlib import Path
 
 @dataclass
 class SBERTaConfig:
-    # ── Vocabulary & sequence ──────────────────────────────────────────────
-    vocab_size: int = 50_265
+    vocab_size: int = 50_000
     max_position_embeddings: int = 512
     pad_token_id: int = 0
+    unk_token_id: int = 1
     mask_token_id: int = 2
+    sep_token_id: int = 3
 
-    # ── Architecture ──────────────────────────────────────────────────────
     hidden_size: int = 768
     num_hidden_layers: int = 12
     num_attention_heads: int = 12
     intermediate_size: int = 3072
+    n_base_layers: int = 6
     layer_norm_eps: float = 1e-12
 
-    # ── Two-phase encoder ─────────────────────────────────────────────────
-    # Phase 1 (layers 0 … n_base_layers−1): standard attention, no language
-    # bias injected. MLM/RTD distributional pressure forces language-clustered
-    # representations to emerge naturally, as in multilingual BERT.
-    #
-    # Language prototypes are assigned from Phase 1 output — contextual and
-    # meaningful — before any language signal enters the attention stack.
-    #
-    # Phase 2 (layers n_base_layers … num_hidden_layers−1): language-aware
-    # attention with per-head K×K compatibility matrices and switch bias.
-    # p is a real signal by the time it reaches these layers.
-    #
-    # Constraint: 0 < n_base_layers < num_hidden_layers.
-    #
-    # n_base_layers is a hyperparameter to sweep for each new corpus.
-    # The bootstrap paradox justifies that Phase 1 must be long enough for
-    # distributional clustering to emerge (empirically ≥ 4 layers seems
-    # necessary; shallower Phase 1 risks p being noise when Phase 2 starts
-    # specialising). The default of L/2 is a reasonable starting point but
-    # should be validated: try {L//3, L//2, 2*L//3} and pick by prototype
-    # entropy at step 10K.
-    n_base_layers: int = 6
-
-    # ── Code-switching ────────────────────────────────────────────────────
-    num_languages: int = 2
-    proto_temperature: float = 0.5   # stored as log_τ; learnable=False avoids
-                                     # tau decay that sharpens Sinkhorn past
-                                     # convergence
+    num_languages: int = 4
+    proto_temperature: float = 0.5
     learnable_temperature: bool = False
+    prior_ema_momentum: float = 0.98
 
-    # ── Prototype prior — adaptive EMA ────────────────────────────────────
-    # Initialised to uniform (1/K); updated each forward pass from the
-    # Sinkhorn batch marginals. Converges to the true corpus language
-    # distribution within ~500 optimiser steps without any hardcoded signal.
-    # Works on any K-language mixture at any corpus proportion.
-    prior_ema_momentum: float = 0.95  # faster adaptation for small corpus (<50M tokens)
-                                      # use 0.99 for large corpus (>100M tokens)
-
-    # ── Regularisation ────────────────────────────────────────────────────
     hidden_dropout_prob: float = 0.1
     attention_probs_dropout_prob: float = 0.1
 
-    # ── Pre-training (ELECTRA-style RTD) ──────────────────────────────────
     mlm_probability: float = 0.15
     rtd_weight: float = 15.0
     generator_size_divisor: int = 2
-
-    # Geometric span masking — mean span length = 1/span_mask_geo_p tokens
     span_mask_geo_p: float = 0.2
     span_mask_min_len: int = 1
     span_mask_max_len: int = 10
 
-    # Sinkhorn-Knopp clustering (SwAV-style collapse prevention)
     sinkhorn_epsilon: float = 0.1
     sinkhorn_iters: int = 20
+    lambda_cluster: float = 3.0
+    lambda_ortho: float = 1.0
 
-    # ── Loss weights ──────────────────────────────────────────────────────
-    lambda_cluster: float = 3.0   # Sinkhorn prototype equipartition
-    lambda_ortho:   float = 1.0   # prototype geometry: (L_n L_nᵀ − I)² mean
+    learning_rate: float = 1e-4
+    weight_decay: float = 0.01
+    max_grad_norm: float = 1.0
+    max_length: int = 512
+    warmup_ratio: float = 0.06
+    log_every: int = 100
+    checkpoint_every_tokens: int = 25_000_000
+    num_workers: int = 0
 
-    # ─────────────────────────────────────────────────────────────────────
+    cluster_start_ratio: float = 0.05
+    cluster_ramp_ratio: float = 0.10
+    lang_start_ratio: float = 0.15
+    lang_ramp_ratio: float = 0.10
+    lang_min_entropy: float = 0.70
+
     def __post_init__(self) -> None:
-        assert self.hidden_size % self.num_attention_heads == 0, (
-            f"hidden_size ({self.hidden_size}) must be divisible by "
-            f"num_attention_heads ({self.num_attention_heads})"
-        )
-        assert 0 < self.n_base_layers < self.num_hidden_layers, (
-            f"n_base_layers ({self.n_base_layers}) must satisfy "
-            f"0 < n_base_layers < num_hidden_layers ({self.num_hidden_layers})"
-        )
+        if self.hidden_size % self.num_attention_heads != 0:
+            raise ValueError("hidden_size must be divisible by num_attention_heads")
+        if not 0 < self.n_base_layers < self.num_hidden_layers:
+            raise ValueError("n_base_layers must be inside the encoder stack")
+        if self.num_languages < 2:
+            raise ValueError("num_languages must be at least 2")
+        if self.generator_size_divisor < 1:
+            raise ValueError("generator_size_divisor must be positive")
+        if self.max_position_embeddings < self.max_length:
+            raise ValueError("max_position_embeddings must cover max_length")
 
     def save(self, path: str | Path) -> None:
         Path(path).write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
 
     @classmethod
     def load(cls, path: str | Path) -> "SBERTaConfig":
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-        return cls(**data)
+        return cls(**json.loads(Path(path).read_text(encoding="utf-8")))
 
-    # ── Convenience factories ────────────────────────────────────────────
     @classmethod
-    def small(cls) -> "SBERTaConfig":
-        """Quick-experiment config (~17 M params)."""
+    def darija_small(cls) -> "SBERTaConfig":
         return cls(
             hidden_size=256,
             num_hidden_layers=4,
@@ -113,13 +87,7 @@ class SBERTaConfig:
         )
 
     @classmethod
-    def base(cls) -> "SBERTaConfig":
-        """BERT-base equivalent size (~136 M params)."""
-        return cls()            # all defaults; n_base_layers=6 of 12
-
-    @classmethod
-    def medium(cls) -> "SBERTaConfig":
-        """Mid-range config suitable for low-resource experiments (~55 M params)."""
+    def darija_medium(cls) -> "SBERTaConfig":
         return cls(
             hidden_size=512,
             num_hidden_layers=8,
@@ -129,12 +97,9 @@ class SBERTaConfig:
         )
 
     @classmethod
-    def large(cls) -> "SBERTaConfig":
-        """BERT-large equivalent size (requires massive data, ~394 M params)."""
-        return cls(
-            hidden_size=1024,
-            num_hidden_layers=24,
-            num_attention_heads=16,
-            intermediate_size=4096,
-            n_base_layers=12,
-        )
+    def darija_base(cls) -> "SBERTaConfig":
+        return cls()
+
+    small = darija_small
+    medium = darija_medium
+    base = darija_base

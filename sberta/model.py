@@ -1,50 +1,4 @@
-"""
-SBERTa model implementation.
-
-Architecture summary
---------------------
-Design principle: earn the language signal before using it.
-
-Two-phase encoder:
-
-  Phase 1 — Context (layers 0 … n_base_layers−1):
-    Standard attention, no language bias. MLM/RTD distributional pressure
-    forces language-clustered representations to emerge naturally, as in
-    multilingual BERT. No language signal is injected at this stage.
-
-  Language Assignment Pivot:
-    p_t = softmax(H_base_t · Lᵀ / τ)
-    s_t = 1 − p_t ᵀ p_{t−1}
-    Applied to Phase 1 output — contextual and meaningful. Sinkhorn
-    clustering and prototype orthogonality are enforced here.
-
-  Phase 2 — Language-Aware (layers n_base_layers … num_hidden_layers−1):
-    S_h(i,j) = (Qᵢ·Kⱼ)/√dₕ + β · pᵢᵀ Cₕ pⱼ + γ · δ_ij
-    K×K compatibility matrices receive a real signal and learn asymmetric
-    cross-language attention affinities. Temporal coherence across language
-    spans emerges implicitly — no smoothing penalty required.
-
-Pre-training objectives (ELECTRA-style RTD):
-  Generator:     SBERTaGenerator (hidden_size // generator_size_divisor) — MLM on
-                 geometrically-masked spans; proposes plausible token replacements.
-  Discriminator: full SBERTa — RTD binary classification at every token position,
-                 giving 6-7× more gradient signal than vanilla 15%-masked MLM.
-
-  L = L_gen + w_rtd · L_RTD + λ_cluster · L_cluster + λ_ortho · L_ortho
-
-  L_gen        : generator MLM (span-masked positions only; normalised by n_masked)
-  L_RTD        : replaced token detection — supervises every real token position
-  L_cluster    : Sinkhorn-Knopp on Phase 1 (contextual) representations with
-                 adaptive EMA prior — discovers corpus language distribution
-                 online; no hardcoded prior, works on any K-language mixture
-  L_ortho      : (L_n L_nᵀ − I)².mean() — directly regularises prototype geometry,
-                 preventing prototype vectors from drifting together regardless of
-                 what the assignment losses are doing
-
-The model is fully zero-knowledge: no Unicode priors, no script IDs, no
-dictionaries. Language structure emerges purely from the MLM distributional
-objective. Works on any K-language mixture.
-"""
+"""Darija-first SBERTa model with staged code-switching structure."""
 
 from __future__ import annotations
 
@@ -67,53 +21,47 @@ def _geometric_span_mask(
     geo_p: float,
     min_len: int,
     max_len: int,
+    input_ids: Optional[torch.Tensor] = None,
+    special_token_ids: Optional[set[int]] = None,
 ) -> torch.Tensor:
-    """
-    Language-agnostic span masking for the ELECTRA generator.
-
-    Span lengths are sampled from Geometric(geo_p) via inverse CDF, giving a
-    mean span of 1/geo_p tokens (5 at default geo_p=0.2). Spans are placed at
-    random non-overlapping positions until mask_prob of real tokens are covered.
-
-    All random number generation is performed in two bulk CPU calls before any
-    loop begins, eliminating per-iteration CUDA kernel launches.
-
-    Args:
-        attention_mask: (B, T) binary — 1 for real tokens, 0 for padding
-        mask_prob:      target fraction of real tokens to mask
-        geo_p:          geometric distribution parameter (0 < geo_p ≤ 1)
-        min_len:        minimum span length in tokens
-        max_len:        maximum span length in tokens
-    Returns:
-        span_mask: (B, T) bool — True at positions selected for masking
-    """
+    """Mask contiguous eligible spans for the ELECTRA generator."""
     B, T = attention_mask.shape
     device = attention_mask.device
     log1mp = math.log(1.0 - geo_p)
 
-    real_lens = attention_mask.sum(dim=1).cpu()
-    perms = [torch.randperm(max(int(real_lens[b].item()), 1)) for b in range(B)]
-    us       = torch.rand(B, T).clamp_(min=1e-9)
+    eligible = attention_mask.bool().cpu()
+    if input_ids is not None and special_token_ids:
+        ids_cpu = input_ids.cpu()
+        for token_id in special_token_ids:
+            eligible &= ids_cpu.ne(token_id)
+
+    perms = [torch.randperm(max(int(eligible[b].sum().item()), 1)) for b in range(B)]
+    us = torch.rand(B, T).clamp_(min=1e-9)
     raw_lens = us.log_().div_(log1mp).ceil_().clamp_(min_len, max_len).int()
     span_mask = torch.zeros(B, T, dtype=torch.bool)
 
     for b in range(B):
-        real_len = int(real_lens[b].item())
-        if real_len == 0:
+        positions = eligible[b].nonzero(as_tuple=False).flatten()
+        n_eligible = int(positions.numel())
+        if n_eligible == 0:
             continue
-        target_n    = max(1, int(real_len * mask_prob))
-        n_masked    = 0
+        target_n = max(1, int(n_eligible * mask_prob))
+        n_masked = 0
         span_lens_b = raw_lens[b].tolist()
-        for idx, start in enumerate(perms[b].tolist()):
+        for idx, pos_idx in enumerate(perms[b].tolist()):
             if n_masked >= target_n:
                 break
-            if start >= real_len or span_mask[b, start]:
+            start = int(positions[pos_idx].item())
+            if span_mask[b, start]:
                 continue
-            span_len = min(span_lens_b[idx], real_len - start, target_n - n_masked)
-            if span_len <= 0:
-                continue
-            span_mask[b, start : start + span_len] = True
-            n_masked += span_len
+            span_len = min(span_lens_b[idx], target_n - n_masked)
+            for j in range(start, min(T, start + span_len)):
+                if not eligible[b, j] or span_mask[b, j]:
+                    break
+                span_mask[b, j] = True
+                n_masked += 1
+                if n_masked >= target_n:
+                    break
 
     return span_mask.to(device)
 
@@ -170,18 +118,7 @@ def _sinkhorn(
 
 
 class LanguagePrototypes(nn.Module):
-    """
-    K learned prototype vectors L ∈ ℝ^{K×d} with learnable temperature τ.
-
-    Applied at the Phase 1 / Phase 2 boundary, where H_base is contextual
-    and distributions p are therefore meaningful from step one.
-
-    Responsibilities:
-      · Compute language distributions p_t from contextual Phase 1 output.
-      · Compute continuous switch magnitudes s_t.
-
-    Temperature τ is stored as log_τ for unconstrained optimisation.
-    """
+    """Prototype vectors used after Phase 1 has built context."""
 
     def __init__(self, config: SBERTaConfig) -> None:
         super().__init__()
@@ -240,13 +177,7 @@ class LanguagePrototypes(nn.Module):
 
 
 class SBERTaEmbeddings(nn.Module):
-    """
-    h = LN(E_tok(x) + E_pos(t))
-
-    Pure token + positional embeddings with no language augmentation.
-    Language signal enters the sequence after Phase 1 has produced
-    contextual representations — not at the raw embedding stage.
-    """
+    """Token and position embeddings."""
 
     def __init__(self, config: SBERTaConfig) -> None:
         super().__init__()
@@ -280,24 +211,7 @@ class SBERTaEmbeddings(nn.Module):
 
 
 class SBERTaAttention(nn.Module):
-    """
-    Multi-head self-attention with an optional per-head K×K language-compatibility
-    bias term, used in Phase 2 layers.
-
-    Phase 1 layers instantiate this module with use_lang_bias=False, in which
-    case the attention reduces to standard scaled dot-product attention and the
-    compat / beta / gamma parameters are not created.
-
-    Phase 2 score:
-      S_h(i,j) = (Qᵢ · Kⱼ) / √dₕ  +  β · pᵢᵀ Cₕ pⱼ  +  γ · δ_ij
-
-    where δ_ij = 1 − pᵢᵀ pⱼ is the pairwise language divergence (computed from
-    p inside forward; no separate s argument is required).
-
-    Cₕ ∈ ℝ^{K×K} per head, initialised to zero (starts from standard
-    attention; learns asymmetric language affinities as training progresses).
-    β and γ initialised to 0.01.
-    """
+    """Self-attention with optional ramped language bias."""
 
     def __init__(self, config: SBERTaConfig, use_lang_bias: bool = True) -> None:
         super().__init__()
@@ -335,6 +249,7 @@ class SBERTaAttention(nn.Module):
         H: torch.Tensor,                               # (B, T, d)
         p: Optional[torch.Tensor] = None,              # (B, T, K) — required for Phase 2
         additive_mask: Optional[torch.Tensor] = None,  # (B, 1, 1, T)
+        lang_bias_scale: float = 1.0,
     ) -> torch.Tensor:
         """
         Args:
@@ -349,8 +264,6 @@ class SBERTaAttention(nn.Module):
         K_ = self._split(self.W_K(H))
         V  = self._split(self.W_V(H))
 
-        # ── Fast Path (Phase 1) ───────────────────────────────────────────
-        # Uses PyTorch 2.0+ Scaled Dot Product Attention (FlashAttention)
         if not self.use_lang_bias:
             dropout_p = self.attn_drop.p if self.training else 0.0
             out = F.scaled_dot_product_attention(
@@ -360,17 +273,16 @@ class SBERTaAttention(nn.Module):
             )
             return self.W_O(self._merge(out))
 
-        # ── Slow Path (Phase 2) ───────────────────────────────────────────
-        # Materializes the full N² attention matrix to add the language bias
         scores = torch.matmul(Q, K_.transpose(-2, -1)) / self.scale  # (B, H, T, T)
 
-        if self.use_lang_bias and p is not None:
+        if self.use_lang_bias and p is not None and lang_bias_scale > 0.0:
             p_compat = torch.einsum("bik,hkl->bhil", p, self.compat)      # (B, H, T, K)
             sem_bias = torch.einsum("bhil,bjl->bhij", p_compat, p)        # (B, H, T, T)
-            # Pairwise language divergence: δ_ij = 1 - p_iᵀ p_j
             delta_ij = 1.0 - torch.matmul(p, p.transpose(-1, -2)).unsqueeze(1) # (B, 1, T, T)
             
-            scores = scores + self.beta * sem_bias + self.gamma * delta_ij
+            scores = scores + lang_bias_scale * (
+                self.beta * sem_bias + self.gamma * delta_ij
+            )
 
         if additive_mask is not None:
             scores = scores + additive_mask
@@ -383,15 +295,7 @@ class SBERTaAttention(nn.Module):
 
 
 class SBERTaLayer(nn.Module):
-    """
-    One SBERTa encoder layer (Pre-LN).
-
-    When use_lang_bias=False (Phase 1): standard BERT-style transformer layer.
-    When use_lang_bias=True  (Phase 2): language-aware layer with K×K compat bias.
-
-    The same module class is used for both phases; the distinction is made at
-    construction time and stored in the attention sub-module.
-    """
+    """One Pre-LN encoder layer."""
 
     def __init__(self, config: SBERTaConfig, use_lang_bias: bool = True) -> None:
         super().__init__()
@@ -411,6 +315,7 @@ class SBERTaLayer(nn.Module):
         H: torch.Tensor,
         p: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        lang_bias_scale: float = 1.0,
     ) -> torch.Tensor:
         if attention_mask is not None:
             additive: Optional[torch.Tensor] = (
@@ -419,7 +324,7 @@ class SBERTaLayer(nn.Module):
         else:
             additive = None
 
-        H_attn = self.attention(self.norm_attn(H), p, additive)
+        H_attn = self.attention(self.norm_attn(H), p, additive, lang_bias_scale)
         H_mid  = H + self.dropout(H_attn)
         return H_mid + self.dropout(self.ffn(self.norm_ffn(H_mid)))
 
@@ -523,16 +428,7 @@ class SBERTaGenerator(nn.Module):
 
 
 class SBERTaModel(nn.Module):
-    """
-    Bare SBERTa encoder — zero-knowledge, script-agnostic, two-phase.
-
-    forward_phase1: runs Phase 1 layers only and returns H_base, p, s, H_base_norm.
-                    H_base_norm = phase1_norm(H_base) is returned so that
-                    SBERTaForPreTraining can reuse it for L_cluster without a
-                    second LayerNorm call on the same tensor.
-
-    forward: full two-phase pass, returning H_final, p, s, H_base.
-    """
+    """Two-phase encoder for Algerian Darija code-switching."""
 
     def __init__(self, config: SBERTaConfig) -> None:
         super().__init__()
@@ -543,13 +439,6 @@ class SBERTaModel(nn.Module):
             SBERTaLayer(config, use_lang_bias=(i >= config.n_base_layers))
             for i in range(config.num_hidden_layers)
         ])
-        # Two independent LayerNorms — one per phase, one per gradient source.
-        # phase1_norm: normalises Phase 1 output for prototype cosine similarity;
-        #              receives only L_cluster gradients.
-        # final_norm:  normalises Phase 2 output for the RTD binary head;
-        #              receives only L_RTD gradients.
-        # Keeping them separate prevents the two objectives from competing
-        # over shared normalisation parameters.
         self.phase1_norm: nn.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.final_norm:  nn.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
@@ -589,24 +478,12 @@ class SBERTaModel(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         stop_embedding_grad: bool = False,
+        lang_bias_scale: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Full two-phase forward.
-
-        Args:
-            input_ids:           (B, T)
-            attention_mask:      (B, T) binary
-            stop_embedding_grad: If True, detach token embeddings (GDES)
-        Returns:
-            H:      (B, T, d) — Phase 2 final hidden states
-            p:      (B, T, K) — language distributions (from Phase 1 output)
-            s:      (B, T)    — switch magnitudes
-            H_base: (B, T, d) — Phase 1 hidden states (pivot point)
-        """
         H_base, p, s, _ = self.forward_phase1(input_ids, attention_mask, stop_embedding_grad)
         H = H_base
         for layer in self.layers[self.config.n_base_layers :]:
-            H = layer(H, p, attention_mask)
+            H = layer(H, p, attention_mask, lang_bias_scale)
         H = self.final_norm(H)
         return H, p, s, H_base
 
@@ -615,34 +492,7 @@ class SBERTaModel(nn.Module):
 
 
 class SBERTaForPreTraining(nn.Module):
-    """
-    SBERTa with ELECTRA-style RTD pre-training — universal, zero-knowledge.
-
-    Generator (1/generator_size_divisor size):
-      Receives geometrically-masked input; proposes plausible token replacements
-      via MLM. Shares the token embedding weight with the discriminator.
-
-    Discriminator (full SBERTa):
-      Receives corrupted sequence; classifies every real token as real or
-      replaced. Supervised at all T positions — not just the ~15% masked —
-      giving 6-7× more gradient signal than vanilla MLM.
-
-    Loss components:
-      L_gen     : generator MLM on geometrically-masked spans
-      L_RTD     : discriminator real/replaced BCE at every real token (GDES)
-      L_cluster : Sinkhorn-Knopp on Phase 1 contextual representations;
-                  prior is adaptive EMA — discovers corpus language distribution
-                  within ~500 steps, no hardcoded marginals required
-      L_ortho   : (L_n L_nᵀ − I)².mean() — regularises prototype geometry
-                  directly, preventing prototype vectors from drifting together
-                  independently of the assignment losses
-
-    Training efficiency:
-      The pre-training wrapper calls forward_phase1 on the clean (unmasked)
-      input to compute clustering losses, then runs the full discriminator
-      forward on the corrupted sequence. Phase 2 is never executed redundantly
-      on the clean sequence.
-    """
+    """SBERTa with ELECTRA-style pre-training and staged structure losses."""
 
     def __init__(self, config: SBERTaConfig) -> None:
         super().__init__()
@@ -651,10 +501,6 @@ class SBERTaForPreTraining(nn.Module):
         self.generator: SBERTaGenerator = SBERTaGenerator(config)
         self.rtd_head: nn.Linear = nn.Linear(config.hidden_size, 1)
 
-        # Adaptive EMA prior — initialised uniform; updated each forward pass
-        # from Sinkhorn batch marginals; converges to true corpus distribution.
-        # Registered as a buffer: lives on the correct device, included in
-        # state_dict, not an optimised parameter.
         self.register_buffer(
             "_prototype_prior",
             torch.ones(config.num_languages) / config.num_languages,
@@ -675,35 +521,26 @@ class SBERTaForPreTraining(nn.Module):
         self,
         input_ids: torch.Tensor,                         # (B, T)
         attention_mask: Optional[torch.Tensor] = None,   # (B, T) binary
+        cluster_scale: float = 1.0,
+        ortho_scale: float = 1.0,
+        lang_bias_scale: float = 1.0,
     ) -> dict:
-        """
-        Args:
-            input_ids:      (B, T) — original (unmasked) token ids.
-            attention_mask: (B, T) — 1 for real tokens, 0 for padding.
-        Returns:
-            dict with scalar 'loss' and per-component loss values.
-        """
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
 
         cfg  = self.config
         real = attention_mask.bool()
+        special_ids = {
+            cfg.pad_token_id,
+            cfg.unk_token_id,
+            cfg.mask_token_id,
+            cfg.sep_token_id,
+        }
 
-        # ── Step 1: Phase 1 forward on clean input ────────────────────────
-        # H_base is contextual — meaningful for prototype assignment.
-        # p and s are derived from real (unmasked) language structure.
-        # H_base_norm is cached here to avoid calling phase1_norm(H_base) again
-        # below for L_cluster (same tensor, same forward pass).
         H_base, p, s, H_base_norm = self.sberta.forward_phase1(input_ids, attention_mask)
 
-        # Cache normalized prototypes once — reused by both L_cluster and
-        # L_ortho. This makes the invariant (same parameter, same pass) explicit
-        # and avoids three separate F.normalize calls on the same nn.Parameter.
         L_norm = F.normalize(self.sberta.prototypes.prototypes, dim=-1)  # (K, d)
 
-        # ── L_cluster: Sinkhorn on Phase 1 contextual representations ─────
-        # Reuses H_base_norm from forward_phase1 — no second final_norm call.
-        # Scores mirror get_distributions exactly (same dot-product / tau).
         real_h       = H_base_norm[real]                                    # (N_real, d)
         proto_scores = real_h @ L_norm.T / self.sberta.prototypes.tau      # (N_real, K)
         Q = _sinkhorn(
@@ -714,51 +551,56 @@ class SBERTaForPreTraining(nn.Module):
         )
         loss_cluster = F.cross_entropy(proto_scores, Q)
 
-        # ── Adaptive EMA prior update ─────────────────────────────────────
-        # Tracks the true corpus language distribution from Sinkhorn marginals.
-        # No gradient — buffer update only.
         with torch.no_grad():
-            batch_marginal = Q.sum(dim=0)
+            batch_marginal = p[real].mean(dim=0)
             batch_marginal = batch_marginal / batch_marginal.sum().clamp(min=1e-8)
             self._prototype_prior.mul_(cfg.prior_ema_momentum).add_(
                 batch_marginal * (1.0 - cfg.prior_ema_momentum)
             )
 
-        # ── L_ortho: prototype geometry ───────────────────────────────────
-        # Reuses L_norm cached above — prevents prototype vectors from drifting
-        # together regardless of assignment dynamics.
         gram       = L_norm @ L_norm.T                                      # (K, K)
         eye        = torch.eye(cfg.num_languages, device=gram.device)
         loss_ortho = (gram - eye).pow(2).mean()
 
-        # ── Step 2: geometric span masking ────────────────────────────────
         span_mask = _geometric_span_mask(
             attention_mask, cfg.mlm_probability,
             cfg.span_mask_geo_p, cfg.span_mask_min_len, cfg.span_mask_max_len,
+            input_ids=input_ids,
+            special_token_ids=special_ids,
         )
         masked_ids = input_ids.clone()
         masked_ids[span_mask] = cfg.mask_token_id
 
-        # ── Step 3: generator — MLM logits + token sampling ───────────────
         gen_logits = self.generator(masked_ids, self._tok_w, attention_mask)  # (B, T, V)
 
         with torch.no_grad():
-            gen_tokens = torch.multinomial(
-                F.softmax(gen_logits[span_mask].detach(), dim=-1),
-                num_samples=1,
-            ).squeeze(-1)
+            gen_tokens = input_ids.new_empty((0,))
+            if span_mask.any():
+                sample_logits = gen_logits[span_mask].detach().clone()
+                sample_logits[:, list(special_ids)] = torch.finfo(sample_logits.dtype).min
+                gen_tokens = torch.multinomial(
+                    F.softmax(sample_logits, dim=-1),
+                    num_samples=1,
+                ).squeeze(-1)
+            sampled_special_count = sum(
+                int(gen_tokens.eq(token_id).sum().item()) for token_id in special_ids
+            )
+            masked_special_count = sum(
+                int((span_mask & input_ids.eq(token_id)).sum().item()) for token_id in special_ids
+            )
 
         corrupted_ids = input_ids.clone()
-        corrupted_ids[span_mask] = gen_tokens
+        if span_mask.any():
+            corrupted_ids[span_mask] = gen_tokens
         is_replaced   = (corrupted_ids != input_ids).float()
 
-        # ── Step 4: discriminator on corrupted sequence ───────────────────
-        # GDES: RTD gradients do not flow into the shared embedding table.
-        # Only the generator's MLM loss shapes the shared embeddings.
-        # Full two-phase forward — Phase 2 runs on corrupted input only.
-        H, _, _, _ = self.sberta(corrupted_ids, attention_mask, stop_embedding_grad=True)
+        H, _, _, _ = self.sberta(
+            corrupted_ids,
+            attention_mask,
+            stop_embedding_grad=True,
+            lang_bias_scale=lang_bias_scale,
+        )
 
-        # ── L_gen ─────────────────────────────────────────────────────────
         gen_labels = input_ids.new_full(input_ids.shape, -100)
         gen_labels[span_mask] = input_ids[span_mask]
         n_masked = max(int(span_mask.sum().item()), 1)
@@ -769,7 +611,6 @@ class SBERTaForPreTraining(nn.Module):
             reduction="sum",
         ) / n_masked
 
-        # ── L_RTD ─────────────────────────────────────────────────────────
         rtd_logits = self.rtd_head(H).squeeze(-1)
         loss_rtd   = F.binary_cross_entropy_with_logits(
             rtd_logits[real], is_replaced[real], reduction="mean"
@@ -777,14 +618,24 @@ class SBERTaForPreTraining(nn.Module):
 
         with torch.no_grad():
             rtd_preds = (rtd_logits[real] > 0.0).float()
-            rtd_acc   = (rtd_preds == is_replaced[real]).float().mean().item()
+            rtd_labels = is_replaced[real]
+            tp = ((rtd_preds == 1) & (rtd_labels == 1)).sum().float()
+            fp = ((rtd_preds == 1) & (rtd_labels == 0)).sum().float()
+            fn = ((rtd_preds == 0) & (rtd_labels == 1)).sum().float()
+            rtd_acc = (rtd_preds == rtd_labels).float().mean().item()
+            rtd_precision = (tp / (tp + fp).clamp(min=1.0)).item()
+            rtd_recall = (tp / (tp + fn).clamp(min=1.0)).item()
+            rtd_f1 = (
+                2.0 * rtd_precision * rtd_recall
+                / max(rtd_precision + rtd_recall, 1e-8)
+            )
+            replaced_rate = rtd_labels.mean().item()
 
-        # ── Combined loss ─────────────────────────────────────────────────
         loss = (
             loss_gen
             + cfg.rtd_weight    * loss_rtd
-            + cfg.lambda_cluster * loss_cluster
-            + cfg.lambda_ortho  * loss_ortho
+            + cluster_scale * cfg.lambda_cluster * loss_cluster
+            + ortho_scale * cfg.lambda_ortho  * loss_ortho
         )
 
         return {
@@ -794,7 +645,16 @@ class SBERTaForPreTraining(nn.Module):
             "loss_cluster":      loss_cluster.item(),
             "loss_ortho":        loss_ortho.item(),
             "rtd_acc":           rtd_acc,
+            "rtd_precision":     rtd_precision,
+            "rtd_recall":        rtd_recall,
+            "rtd_f1":            rtd_f1,
+            "replaced_rate":     replaced_rate,
+            "sampled_special_count": sampled_special_count,
+            "masked_special_count":  masked_special_count,
             "n_masked":          n_masked,
+            "cluster_scale":     cluster_scale,
+            "ortho_scale":       ortho_scale,
+            "lang_bias_scale":   lang_bias_scale,
             "language_probs":    p,    # (B, T, K) — from unmasked Phase 1 output
             "switch_magnitudes": s,    # (B, T)    — from unmasked Phase 1 output
         }

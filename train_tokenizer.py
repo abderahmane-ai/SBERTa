@@ -6,9 +6,9 @@ Trains a 50 k SentencePiece Unigram model on a Darija corpus.
 Usage
 -----
     python train_tokenizer.py \
-        --input  data/raw/*.txt      \
-        --output runs/tokenizer/     \
-        --vocab_size 50265           \
+        --input data/raw/*.txt \
+        --output runs/tokenizer \
+        --vocab_size 50000 \
         --num_threads 8
 
 The script:
@@ -144,7 +144,7 @@ def write_normalised_corpus(
 def train(
     corpus_path: Path,
     output_prefix: Path,
-    vocab_size: int = 50_265,
+    vocab_size: int = 50_000,
     character_coverage: float = 0.9999,
     num_threads: int = 4,
     input_sentence_size: int = 10_000_000,
@@ -264,8 +264,8 @@ def parse_args() -> argparse.Namespace:
         help="Output directory. Will contain sberta.model and sberta.vocab.",
     )
     parser.add_argument(
-        "--vocab_size", type=int, default=50_265,
-        help="Vocabulary size (default: 50265, must match SBERTaConfig.vocab_size).",
+        "--vocab_size", type=int, default=50_000,
+        help="Vocabulary size (default: 50000, must match SBERTaConfig.vocab_size).",
     )
     parser.add_argument(
         "--character_coverage", type=float, default=0.9999,

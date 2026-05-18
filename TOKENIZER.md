@@ -1,8 +1,10 @@
 # Tokenizer Reference
 
-> **Part of the SBERTa project.** For model architecture and training, see [README.md](README.md).
+> Part of the SBERTa project. For model architecture and training, see [README.md](README.md) and [ARCHITECTURE.md](ARCHITECTURE.md).
 
-The SBERTa tokenizer is a custom **SentencePiece Unigram** model built for **Algerian Darija**, a North African Arabic variety characterised by pervasive code-switching across Arabic, French, Berber (Tamazight), and Arabizi scripts.
+SBERTa uses a custom **SentencePiece Unigram** tokenizer for **Algerian Darija**, a North African Arabic variety with pervasive code-switching across Arabic script, Arabizi, French, Tamazight-influenced forms, and informal social-media spellings.
+
+The tokenizer is Darija-specific. It is not just a generic multilingual tokenizer with a Darija corpus behind it.
 
 ---
 
@@ -15,90 +17,107 @@ The SBERTa tokenizer is a custom **SentencePiece Unigram** model built for **Alg
 - [Special Tokens](#special-tokens)
 - [File Reference](#file-reference)
 - [Usage](#usage)
-- [Training the Tokenizer](#training-the-tokenizer)
+- [Training The Tokenizer](#training-the-tokenizer)
 
 ---
 
 ## Algorithm Choice
 
-SBERTa uses the **Unigram Language Model** algorithm from SentencePiece. This differs fundamentally from Byte-Pair Encoding (BPE):
+SBERTa uses the **Unigram Language Model** algorithm from SentencePiece.
 
 | Property | BPE | Unigram LM |
 | :--- | :--- | :--- |
-| **Strategy** | Greedy merge rules | Probabilistic EM optimisation |
-| **Segmentation** | Single deterministic path | Best path + sampling |
-| **Morphology** | Struggles with agglutinative/mixed scripts | Robust — models piece probability directly |
-| **Data augmentation** | No | Yes — subword regularisation |
+| Strategy | Greedy merge rules | Probabilistic EM optimisation |
+| Segmentation | One deterministic path | Best path plus sampling |
+| Morphology | Can over-merge frequent forms | Learns piece probabilities |
+| Data augmentation | No native sampling | Supports subword regularisation |
 
 ### Subword Regularisation
 
-During pre-training, the tokenizer samples from the distribution of valid segmentations instead of always taking the single best path. For a language like Darija — where the same word can be spelled dozens of ways — this provides **built-in data augmentation** and improves robustness to orthographic variance.
+Darija words often have many spellings: Arabic script variation, Arabizi digit-phonemes, French loanwords, and informal elongation. During pre-training, the tokenizer can sample from valid segmentations:
 
-Controlled by `encode(..., sample=True, sample_alpha=0.1)`.
+```python
+tok.encode("wach rak labas?", sample=True, sample_alpha=0.1)
+```
+
+This acts as lightweight data augmentation without changing the corpus.
 
 ---
 
 ## Normalisation Pipeline
 
-Before tokenisation, all text passes through a deterministic normalisation function (`sberta/tokenizer.py → normalise()`). **Order is critical.**
+All text passes through `sberta/tokenizer.py -> normalise()`.
 
-```
+```text
 Raw text
-   │
-   ├─ 1. NFC Unicode normalisation
-   │      Collapses compatibility variants (e.g. ﻻ → لا)
-   │
-   ├─ 2. Strip Arabic harakat (diacritics)
-   │      Strips U+0610–U+061A, U+064B–U+065F, U+0670, U+06D6–U+06ED
-   │      These are absent in native Darija; they appear only in copy-pasted MSA or religious text.
-   │
-   ├─ 3. Remove tatweel (kashida)
-   │      Strips U+0640 — a decorative elongation glyph.
-   │      "كييييف" and "كيف" become the same token.
-   │
-   ├─ 4. Arabic-Indic digits → ASCII
-   │      ٠١٢٣٤٥٦٧٨٩  →  0123456789
-   │      Prevents the same Arabizi digit-phoneme (e.g. 3) appearing as two token types.
-   │
-   ├─ 5. Lowercase non-Arabic characters
-   │      Latin and other non-Arabic uppercase → lowercase.
-   │      Arabic has no case concept; the Arabic Unicode block is left untouched.
-   │
-   └─ 6. Collapse whitespace
-          Normalise runs of whitespace to single spaces.
+   |
+   +-- 1. NFC Unicode normalisation
+   |
+   +-- 2. Strip Arabic harakat
+   |
+   +-- 3. Remove tatweel
+   |
+   +-- 4. Arabic-Indic digits -> ASCII
+   |
+   +-- 5. Fold French accents
+   |
+   +-- 6. Lowercase ASCII uppercase
+   |
+   +-- 7. Fold Arabic orthographic variants
+   |
+   +-- 8. Cap character elongations at two repeats
+   |
+   +-- 9. Collapse whitespace
 ```
+
+### Arabic Normalisation
+
+| Input pattern | Normalised form | Reason |
+| :--- | :--- | :--- |
+| `أ إ آ` | `ا` | Reduces sparse Alef variants |
+| `ة` | `ه` | Common dialectal spelling fold |
+| `ى` | `ي` | Reduces orthographic duplicates |
+| Harakat | removed | Rare in native Darija text |
+| Tatweel | removed | Decorative, not lexical |
+
+### Latin / French Normalisation
+
+French accents are folded to base Latin characters, and ASCII uppercase is lowercased. This keeps `ça`, `ca`, `École`, and `ecole` closer in the vocabulary when they appear inside Darija contexts.
+
+### Elongation
+
+Character elongations are capped at two repeats:
+
+```text
+haaaaaay -> haay
+كييييف -> كييف
+```
+
+This keeps expressive spelling without letting extreme elongation dominate the vocabulary.
 
 ---
 
 ## Arabizi Handling
 
-**Arabizi** is an informal writing system that represents Arabic phonemes using Latin letters and digit substitutes:
+Arabizi represents Arabic phonemes with Latin letters and digits:
 
-| Digit | Arabic phoneme | Example |
-| :---: | :---: | :--- |
-| `2` | ء (hamza) | `2ana` = أنا |
-| `3` | ع (ayn) | `3ndek` = عندك |
-| `5` | خ (kha) | `5oya` = خويا |
-| `7` | ح (ha) | `7atta` = حتى |
-| `9` | ق (qaf) | `m9abel` = مقابل |
+| Digit | Approximate phoneme | Example |
+| :---: | :--- | :--- |
+| `2` | hamza | `2ana` |
+| `3` | ayn | `3ndek` |
+| `5` | kha | `5oya` |
+| `7` | ha | `7atta` |
+| `9` | qaf/gaf-like forms | `m9abel` |
 
-These digit-phonemes are **phonemic units** in Arabizi. Splitting on digit boundaries would fragment words like `3ndek` and `m9abel` into meaningless pieces.
+These digits are linguistic characters in Arabizi. The tokenizer preserves them by training SentencePiece with:
 
-### How the tokenizer preserves Arabizi
-
-The SentencePiece model is trained with:
-
-```
---split_digits=false              # 3ndek stays together
---split_by_number=false           # digits/letters can mix in one word
---split_by_unicode_script=false   # no forced splits at Arabic↔Latin boundaries
+```text
+--split_digits=false
+--split_by_number=false
+--split_by_unicode_script=false
 ```
 
-Digit-phonemes survive the normalisation pipeline unchanged (no digit stripping). The Unigram model learns them as coherent lexical units because they appear consistently in Darija text.
-
-### No script-boundary pre-tokenisation
-
-Some tokenizers force token breaks whenever the script changes (e.g. Arabic → Latin). SBERTa deliberately **does not do this**. The prototype mechanism learns language identity endogenously from token embeddings; pre-empting it with hard script boundaries would undermine the model's ability to represent code-switching as a gradient phenomenon.
+This prevents words such as `3ndek`, `m7el`, and `m9abel` from being fragmented at digit or script boundaries.
 
 ---
 
@@ -106,29 +125,30 @@ Some tokenizers force token breaks whenever the script changes (e.g. Arabic → 
 
 | Parameter | Value | Rationale |
 | :--- | :---: | :--- |
-| `vocab_size` | 50,265 | Matches `SBERTaConfig.vocab_size`; same as RoBERTa for comparability |
-| `model_type` | `unigram` | Probabilistic EM; handles script imbalance better than BPE |
-| `character_coverage` | 0.9999 | Retains essentially all character types across all scripts |
-| `byte_fallback` | `true` | Unseen characters → UTF-8 byte tokens; zero information loss |
-| `max_sentencepiece_length` | 16 | Prevents multi-morpheme clusters from being learned as one piece |
-| `split_digits` | `false` | Preserves Arabizi digit-phonemes |
-| `split_by_unicode_script` | `false` | Preserves mixed-script Arabizi words |
-| `BOS / EOS` | disabled | SBERTa uses mean-pooling; no sentinel tokens needed |
+| `vocab_size` | 50,000 | Comparable to DziriBERT and large enough for mixed scripts |
+| `model_type` | `unigram` | Probabilistic segmentation and sampling |
+| `character_coverage` | 0.9999 | Keeps rare script characters |
+| `byte_fallback` | true | Avoids true unknown-character loss |
+| `max_sentencepiece_length` | 16 | Avoids over-long memorised chunks |
+| `split_digits` | false | Preserves Arabizi digit-phonemes |
+| `split_by_number` | false | Allows mixed digit/letter words |
+| `split_by_unicode_script` | false | Keeps mixed-script tokens intact |
+| BOS / EOS | disabled | SBERTa uses `[SEP]`, not BOS/EOS |
 
 ---
 
 ## Special Tokens
 
-Special token IDs are **baked into the SentencePiece model** at training time. The wrapper never shifts IDs manually.
+Special token IDs are baked into the SentencePiece model.
 
 | Token | ID | Role |
 | :--- | :---: | :--- |
-| `[PAD]` | **0** | Padding to fill batches to a fixed length. |
-| `[UNK]` | **1** | Unknown token. Rarely fires — byte fallback is always active. |
-| `[MASK]` | **2** | Masked position for the MLM pre-training objective. |
-| `[SEP]` | **3** | Sequence separator; appended to every encoded sequence. Used for sentence-pair fine-tuning. |
+| `[PAD]` | 0 | Padding |
+| `[UNK]` | 1 | Unknown fallback, rarely used with byte fallback |
+| `[MASK]` | 2 | Generator MLM masking |
+| `[SEP]` | 3 | Sequence separator |
 
-> **No `[CLS]`** — SBERTa obtains sequence representations via **mean-pooling** over all final hidden states, not a special prepended token.
+During pre-training, `[PAD]`, `[UNK]`, `[MASK]`, and `[SEP]` are excluded from generator replacement sampling.
 
 ---
 
@@ -136,106 +156,74 @@ Special token IDs are **baked into the SentencePiece model** at training time. T
 
 | File | Purpose |
 | :--- | :--- |
-| [`sberta/tokenizer.py`](sberta/tokenizer.py) | `SBERTaTokenizer` class + `normalise()` function |
-| [`train_tokenizer.py`](train_tokenizer.py) | CLI to train a new SP model from a raw corpus |
-| [`scripts/clean_corpus.py`](scripts/clean_corpus.py) | Corpus pre-processor: strips URLs, HTML, mentions, hashtags, long numbers, emoji, and duplicate lines |
+| `sberta/tokenizer.py` | Tokenizer wrapper and normaliser |
+| `train_tokenizer.py` | SentencePiece training CLI |
+| `scripts/prepare_corpus.py` | Corpus cleaning, deduplication, manifest writing |
+| `DATA.md` | Data source policy and manifest schema |
 
 ---
 
 ## Usage
 
-### Basic encoding
+### Basic Encoding
 
 ```python
 from sberta.tokenizer import SBERTaTokenizer
 
 tok = SBERTaTokenizer("runs/tokenizer/sberta.model")
-
-# Single string → list of token IDs (includes [SEP])
 ids = tok.encode("wach rak labas?")
-print(ids)
-# → [4312, 7891, 3201, 914, 23, 3]
-
-# View piece strings
-print(tok.convert_ids_to_tokens(ids))
-# → ['▁wach', '▁rak', '▁la', 'bas', '?', '[SEP]']
+pieces = tok.convert_ids_to_tokens(ids)
 ```
 
-### Subword regularisation (for training)
-
-```python
-# Sample a random valid segmentation instead of the Viterbi path
-ids = tok.encode("wach rak labas?", sample=True, sample_alpha=0.1)
-```
-
-### Batch encoding
+### Batch Encoding
 
 ```python
 batch = tok.batch_encode(
-    ["wach rak?", "أنا بخير"],
+    ["wach rak?", "أنا labas"],
     max_length=128,
-    return_tensors=True,   # returns torch.Tensors
+    return_tensors=True,
 )
-# batch["input_ids"]      → Tensor(2, 128)  dtype=int64
-# batch["attention_mask"] → Tensor(2, 128)  dtype=int64  (0 = padding)
 ```
 
-### Sentence pairs (fine-tuning)
+### Sentence Pairs
 
 ```python
-ids, token_type_ids = tok.encode_pair("wach rak?", "labas, Hamdullah")
-# ids            → A [SEP] B [SEP]  (concatenated)
-# token_type_ids → 0…0 1…1         (segment A vs B)
+ids, token_type_ids = tok.encode_pair("wach rak?", "labas, hamdullah")
 ```
 
 ### Decoding
 
 ```python
 text = tok.decode(ids, skip_special_tokens=True)
-
-texts = tok.batch_decode(batch["input_ids"], skip_special_tokens=True)
-```
-
-### Persistence
-
-```python
-# Save the underlying .model file to a directory
-tok.save("my_tokenizer/")
-
-# Reload from that directory
-tok = SBERTaTokenizer.from_pretrained("my_tokenizer/")
 ```
 
 ---
 
-## Training the Tokenizer
-
-Train a new SentencePiece model from scratch on your corpus:
+## Training The Tokenizer
 
 ```bash
 python train_tokenizer.py \
-    --input  corpus/darija_corpus_clean.txt \
-    --output runs/tokenizer/ \
-    --vocab_size  50265 \
-    --num_threads 8
+  --input corpus/darija_pretrain.txt \
+  --output runs/tokenizer \
+  --vocab_size 50000 \
+  --num_threads 8
 ```
 
-The script will:
-1. Stream all input files through `normalise()` into a single temporary file.
-2. **Upsample Arabic script:** Lines containing >30% Arabic script are yielded 3x to mathematically prevent the Unigram algorithm from starving the Arabic vocabulary in Arabizi-dominated corpora.
-3. Train the SentencePiece Unigram model with the parameters described above.
-4. Run a built-in verification suite to confirm special token IDs and roundtrip fidelity.
-5. Write `sberta.model` and `sberta.vocab` to the output directory.
+The script:
 
-Key CLI options:
+1. Streams input files through `normalise()`.
+2. Upsamples Arabic-heavy lines to protect Arabic-script vocabulary when the corpus is Arabizi-heavy.
+3. Trains SentencePiece Unigram with byte fallback.
+4. Verifies special token IDs and roundtrip behavior.
+5. Writes `sberta.model` and `sberta.vocab`.
+
+Key options:
 
 | Flag | Default | Description |
 | :--- | :---: | :--- |
-| `--vocab_size` | 50265 | Must match `SBERTaConfig.vocab_size` |
-| `--num_threads` | 4 | Parallelism for SP training |
-| `--min_chars` | 5 | Minimum characters per line after normalisation |
-| `--max_lines` | — | Cap input lines (useful for fast iteration) |
-| `--no_verify` | false | Skip post-training verification |
-`--min_chars` | 5 | Minimum characters per line after normalisation |
-| `--max_lines` | — | Cap input lines (useful for fast iteration) |
-| `--no_verify` | false | Skip post-training verification |
+| `--vocab_size` | 50000 | Must match `SBERTaConfig.vocab_size` |
+| `--num_threads` | 4 | SentencePiece trainer parallelism |
+| `--min_chars` | 5 | Minimum normalised characters |
+| `--max_lines` | none | Cap lines for fast iteration |
+| `--input_sentence_size` | 10M | SentencePiece sampling cap |
+| `--no_verify` | false | Skip verification |
